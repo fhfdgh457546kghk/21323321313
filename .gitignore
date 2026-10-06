@@ -1,0 +1,8 @@
+*.pyc
+__pycache__/
+.DS_Store
+test-interceptor.js
+test-verify.js
+_run.log
+diag.json
+*.log
