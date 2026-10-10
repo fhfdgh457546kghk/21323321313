@@ -730,6 +730,57 @@ let settings = {
     window.postMessage(Object.assign({ type: 'NOTION_EFFORT_AGENT' }, info), '*');
   }
 
+  const effortHistory = [];
+
+  /** A record with long strings cut: settings and ids stay, message text does not. */
+  function shortJson(v, depth, key) {
+    depth = depth || 0;
+    if (v == null || typeof v === 'number' || typeof v === 'boolean') return v;
+    // Fingerprints are config hashes/descriptors, not text: keep them whole.
+    if (typeof v === 'string') return v.length > (/Fingerprint$/.test(key || '') ? 400 : 80) ? '<' + v.length + ' chars>' : v;
+    if (depth > 6) return '…';
+    if (Array.isArray(v)) return v.slice(0, 20).map((x) => shortJson(x, depth + 1));
+    const o = {};
+    Object.keys(v).slice(0, 60).forEach((k) => { o[k] = shortJson(v[k], depth + 1, k); });
+    return o;
+  }
+
+  // The whole thread record, read fresh, for --probe: everything the server
+  // keeps next to agent_provider (selection source, fallback, limits...).
+  window.__notionEffortProbeThread = function (thread) {
+    const id = dashedId(thread);
+    const spaces = Object.keys(headersBySpace);
+    const tryOne = (i) => {
+      if (i >= spaces.length) return Promise.resolve({ error: 'thread not found in ' + spaces.length + ' workspaces' });
+      return apiPost('probe', dashedId(spaces[i]), '/api/v3/syncRecordValues', {
+        requests: [{ pointer: { table: 'thread', id: id, spaceId: dashedId(spaces[i]) }, version: -1 }],
+      }).then((json) => {
+        const t = json && json.recordMap && json.recordMap.thread;
+        const k = t && Object.keys(t)[0];
+        const v = k && unwrapRecord(t[k]);
+        return v && v.id ? { space: spaces[i], record: shortJson(v) } : tryOne(i + 1);
+      }, () => tryOne(i + 1));
+    };
+    return tryOne(0).then((r) => JSON.stringify(Object.assign(r, {
+      history: effortHistory.filter((h) => h.thread === plainId(thread)),
+    }), null, 2));
+  };
+
+  // The catalogue as one given workspace sees it (plans differ per workspace,
+  // and the picker's catalogue is only read for one of them).
+  window.__notionEffortProbeCatalogue = function (spaceId) {
+    const sid = dashedId(spaceId);
+    return apiPost('probe models', sid, '/api/v3/getAvailableModels', { spaceId: sid, surface: 'workspace_model_settings' })
+      .then((json) => JSON.stringify({
+        space: plainId(sid),
+        models: ((json && json.models) || []).map((m) => ({
+          model: m.model, provider: m.modelProvider, disabled: !!m.isDisabled,
+          restricted: !!m.restrictedForPersonalAgent, config: shortJson(m.modelConfiguration),
+        })),
+        top: shortJson(Object.assign({}, json, { models: undefined })),
+      }, null, 2), (e) => JSON.stringify({ error: String(e.message || e) }));
+  };
+
   function watchAgentResponse(response) {
     if (!response || !response.ok) return Promise.resolve();
     return response.clone().text().then((text) => {
@@ -739,11 +790,21 @@ let settings = {
       found.forEach((f) => {
         if (!f.p.model && !f.p.reasoningEffort) return;
         const key = plainId(f.thread || 'unknown');
+        const prev = agentThreads[key];
+        // Who changed the effort, and with what else in the record: the
+        // server's reason for a reset may sit in a field we do not read.
+        if (!prev || prev.reasoningEffort !== (f.p.reasoningEffort || null)) {
+          logPush(effortHistory, {
+            at: new Date().toISOString(), thread: key, url: (response.url || '').replace(location.origin, ''),
+            from: prev ? prev.reasoningEffort : undefined, to: f.p.reasoningEffort || null, provider: shortJson(f.p),
+          });
+        }
         agentThreads[key] = {
           thread: f.thread,
           model: f.p.model || null,
           modelSelection: f.p.modelSelection || null,
           reasoningEffort: f.p.reasoningEffort || null,
+          sticky: f.p.stickyAutoModelAssignment || null,
         };
       });
       if (found.length) publishAgent();
@@ -903,7 +964,7 @@ let settings = {
   }
 
   function snap(t) {
-    return t ? { model: t.model, modelSelection: t.modelSelection, reasoningEffort: t.reasoningEffort } : null;
+    return t ? { model: t.model, modelSelection: t.modelSelection, reasoningEffort: t.reasoningEffort, sticky: t.sticky || null } : null;
   }
 
   function threadOf(bodyText) {
@@ -922,33 +983,56 @@ let settings = {
     const thread = agentThreads[key] || {};
     // With a model picked, Auto can only route to it, so clamp to its efforts.
     const effort = agentTargetEffort(settings.model || thread.model);
-    if (!effort || thread.reasoningEffort === effort) return Promise.resolve();
+    // Auto keeps its earlier pick in stickyAutoModelAssignment. When that model
+    // is no longer allowed (the policy now allows only the pick), the server
+    // re-routes on every message and takes the model's default effort
+    // (medium), whatever reasoningEffort says. So the sticky pick is rewritten
+    // to the picked model and effort as well.
+    const st = thread.sticky;
+    const wantSticky = settings.model && effort ? { model: settings.model, reasoningEffort: effort } : null;
+    const stickyOff = !!(wantSticky && st && (st.model !== wantSticky.model || st.reasoningEffort !== wantSticky.reasoningEffort));
+    if (!effort || (thread.reasoningEffort === effort && !stickyOff)) return Promise.resolve();
     const args = { reasoningEffort: effort };
-    const detail = { thread: id, from: thread.reasoningEffort || null, to: effort, model: thread.model || null };
-    const tx = (a) => ({
+    const detail = { thread: id, from: thread.reasoningEffort || null, to: effort, model: thread.model || null,
+      sticky: stickyOff ? (st.model + '/' + st.reasoningEffort + ' → ' + wantSticky.model + '/' + effort) : undefined };
+    const op = (path, command, a) => ({ pointer: { table: 'thread', id: id, spaceId: spaceId }, path: path, command: command, args: a });
+    const tx = (ops) => ({
       requestId: crypto.randomUUID(),
       transactions: [{
         id: crypto.randomUUID(),
         spaceId: spaceId,
         debug: { userAction: 'NotionEffort.setThreadConfig' },
-        operations: [{
-          pointer: { table: 'thread', id: id, spaceId: spaceId },
-          path: ['data', 'agent_provider'],
-          command: 'update',
-          args: a,
-        }],
+        operations: ops,
       }],
     });
-    const entry = { at: new Date().toISOString(), thread: id, before: snap(thread), args: args };
+    // The server rejects a whole transaction it does not like (ValidationError),
+    // so the sticky fix is tried in steps and the plain effort write comes last.
+    const base = op(['data', 'agent_provider'], 'update', args);
+    const attempts = [{ name: 'effort only', ops: [base] }];
+    if (stickyOff) {
+      attempts.unshift(
+        { name: 'sticky → pick', ops: [op(['data', 'agent_provider'], 'update', Object.assign({ stickyAutoModelAssignment: wantSticky }, args))] },
+        { name: 'sticky removed', ops: [base, op(['data', 'agent_provider', 'stickyAutoModelAssignment'], 'set', null)] }
+      );
+    }
+    const entry = { at: new Date().toISOString(), thread: id, before: snap(thread), args: args, attempts: [] };
     logPush(writeLog, entry);
     inflight[key] = (async () => {
       try {
-        const res = await txPost(input, options, tx(args));
+        let res = null;
+        let used = null;
+        for (const a of attempts) {
+          res = await txPost(input, options, tx(a.ops));
+          const err = res.ok ? null : (await res.clone().text()).slice(0, 160);
+          entry.attempts.push({ name: a.name, http: res.status, error: err || undefined });
+          if (res.ok) { used = a.name; break; }
+        }
         entry.http = res.status;
         if (res.ok) {
           swappedCount++;
-          trace('effort', 'chat effort ' + (detail.from || 'unset') + ' → ' + detail.to + ' written');
-          reportPref('ok', detail);
+          trace('effort', 'chat effort ' + (detail.from || 'unset') + ' → ' + detail.to + ' written' +
+            (detail.sticky ? ' · Auto sticky pick ' + detail.sticky + ': ' + entry.attempts.map((a) => a.name + ' ' + a.http).join(', ') : ''));
+          reportPref('ok', Object.assign({ via: used }, detail));
           await rereadThread(input, options, id, spaceId).catch(() => {});
           entry.after = snap(agentThreads[key]);
         } else {
@@ -1482,6 +1566,10 @@ let settings = {
       at: new Date().toISOString(), thread: th.key, isNew: isNew,
       watchOnly: watchOnly, picked: watchOnly ? null : settings.model,
       allowed: '…', allowedIds: null, ran: null, ranName: null, effort: null, selection: null, inList: null, checks: 0,
+      // The effort this send asked for (after the model-limit clamp), so the
+      // panel can tell a reset from an older pick.
+      wantEffort: watchOnly || !settings.effort ? null
+        : agentTargetEffort(settings.model || (agentThreads[th.key] || {}).model) || null,
     };
     runs.push(run);
     if (runs.length > 30) runs.shift();
@@ -1678,7 +1766,7 @@ let settings = {
   // copy(__notionEffortAgentDiag()) — everything the effort lever knows.
   window.__notionEffortAgentDiag = function () {
     return JSON.stringify({
-      version: '2.24',
+      version: '2.25',
       watchOnly: watchOnly,
       runs: runs,
       url: location.href,
@@ -1690,6 +1778,15 @@ let settings = {
       lastSave: window.__notionEffortAgentPref || null,
       wanted: settings.effort,
       wantedModel: settings.model,
+      // What the clamp itself believes, per model: the picker's own ceilings.
+      wantedEffortsByModel: (function () {
+        const m = settings.model;
+        return m ? (settings.effortsByModel[m] || null) : null;
+      })(),
+      lastDebug: window.__notionEffortDebug || null,
+      effortHistory: effortHistory,
+      lastModelState: lastModelState,
+      lastRequestedEffort: lastRequestedEffort,
       spaceId: agentSpaceId,
       seenSpaceId: currentSpaceId(),
       headerSpaces: Object.keys(headersBySpace),
@@ -1699,7 +1796,10 @@ let settings = {
       policyBackup: loadBackups(),
       trace: traceLog.map((t) => t.at.slice(11, 19) + ' ' + t.kind + ' ' + t.text),
       catalogue: catalogue && catalogue.models.map((m) => m.model + '/' + m.modelProvider +
-        (m.restrictedForPersonalAgent ? '/restricted' : '') + (m.isDisabled ? '/disabled' : '')),
+        (m.restrictedForPersonalAgent ? '/restricted' : '') + (m.isDisabled ? '/disabled' : '') +
+        // The effort ceiling the clamp reads: without it a max→medium drop
+        // cannot be told apart from the server ignoring the ask.
+        '[' + (((m.modelConfiguration && m.modelConfiguration.supportedReasoningEfforts) || []).join(',') || '?') + ']'),
       catalogueKeys: catalogue && catalogue.models[0] ? Object.keys(catalogue.models[0]) : null,
       writes: writeLog,
       foreign: foreignLog,

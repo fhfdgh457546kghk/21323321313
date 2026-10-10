@@ -379,6 +379,18 @@ async function run() {
         if (!got || !got.text) return send(404, { error: 'no Notion page with the panel found' });
         return send(200, got);
       }
+      if (req.url.startsWith('/probe?s=')) {
+        const s = decodeURIComponent(req.url.slice(9)).replace(/[^0-9a-f-]/gi, '');
+        const got = await evalOnNotion(browser, 'typeof __notionEffortProbeCatalogue === "function" ? __notionEffortProbeCatalogue(' + JSON.stringify(s) + ') : null');
+        if (!got) return send(404, { error: 'no Notion page with the panel found' });
+        return send(200, { text: got });
+      }
+      if (req.url.startsWith('/probe?t=')) {
+        const t = decodeURIComponent(req.url.slice(9)).replace(/[^0-9a-f-]/gi, '');
+        const got = await evalOnNotion(browser, 'typeof __notionEffortProbeThread === "function" ? __notionEffortProbeThread(' + JSON.stringify(t) + ') : null');
+        if (!got) return send(404, { error: 'no Notion page with the panel found' });
+        return send(200, { text: got });
+      }
       send(404, { error: 'unknown' });
     } catch (e) {
       send(500, { error: String(e.message || e) });
@@ -392,6 +404,27 @@ async function run() {
   await new Promise((r) => browser.onClose ? browser.onClose(r) : setTimeout(r, 60 * 60 * 1000));
   log('connection to Notion lost.');
   process.exit(0);
+}
+
+/** First Notion page that returns a value for the expression (awaits promises). */
+async function evalOnNotion(browser, expression) {
+  let targets;
+  try { targets = (await browser.send('Target.getTargets')).targetInfos; } catch (e) { return null; }
+  const pages = (targets || []).filter((t) => t.type === 'page' && /^https:\/\/([a-z0-9-]+\.)?notion\.(so|com)\//.test(t.url));
+  for (const t of pages) {
+    let sessionId;
+    try {
+      sessionId = (await browser.send('Target.attachToTarget', { targetId: t.targetId, flatten: true })).sessionId;
+      const r = await withTimeout(browser.send('Runtime.evaluate', { expression, returnByValue: true, awaitPromise: true }, sessionId), 15000);
+      const v = r && r.result && r.result.value;
+      if (v) return v;
+    } catch (e) {
+      continue;
+    } finally {
+      if (sessionId) browser.send('Target.detachFromTarget', { sessionId }).catch(() => {});
+    }
+  }
+  return null;
 }
 
 async function readDiag(browser) {

@@ -6,3 +6,6 @@ test-verify.js
 _run.log
 diag.json
 *.log
+diag_live*.json
+probe_*.json
+cat_*.json

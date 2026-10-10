@@ -165,6 +165,7 @@
         transition: background 120ms ease, border-color 120ms ease;
       }
       .pill:hover { background: #2f2f2f; }
+      .pill.ok { border-color: rgba(76,183,130,0.7); }
       .pill.warn { border-color: rgba(214,167,74,0.7); }
       .pill.err { border-color: rgba(235,100,95,0.7); }
       .pill .eff {
@@ -177,7 +178,22 @@
         color: #bdbdb8;
       }
       .pill .eff.on { background: #3b6ef0; color: #fff; }
+      /* Picked, but the chat runs something else: picked struck out, real next to it. */
+      .pill .eff.was, .pill .pwant { text-decoration: line-through; opacity: 0.55; }
+      .pill .eff.was { background: rgba(255,255,255,0.09); color: #bdbdb8; }
+      .pill .pwant { color: #bdbdb8; }
+      .pill .real {
+        font-size: 10px; letter-spacing: 0.03em; text-transform: uppercase;
+        padding: 2px 4px; border-radius: 4px;
+        background: rgba(255,255,255,0.16); color: #e9e9e7;
+      }
+      .pill .real::before { content: '→ '; }
+      .pill .real.err { background: #eb645f; color: #fff; }
+      .pill .real.warn { background: #d6a74a; color: #1d1d1d; }
+      .model .mmeta b.err { color: #eb645f; }
+      .model .mmeta b.warn { color: #d6a74a; }
       .pill .dot { width: 6px; height: 6px; border-radius: 50%; background: #5c5c5c; }
+      .pill .dot.ok { background: #4cb782; }
       .pill .dot.warn { background: #d6a74a; }
       .pill .dot.err { background: #eb645f; }
 
@@ -263,6 +279,7 @@
         gap: 6px;
       }
       .foot .sd { width: 6px; height: 6px; border-radius: 50%; background: #5c5c5c; flex: none; }
+      .foot .sd.ok { background: #4cb782; }
       .foot .sd.warn { background: #d6a74a; }
       .foot .sd.err { background: #eb645f; }
       .foot .txt { flex: 1; }
@@ -307,8 +324,10 @@
 
     <button class="pill" type="button" part="pill">
       <span class="dot"></span>
+      <span class="pwant hidden"></span>
       <span class="pname">Effort</span>
       <span class="eff">Auto</span>
+      <span class="real hidden"></span>
     </button>
 
     <div class="menu hidden">
@@ -346,6 +365,8 @@
   const pillEff = shadow.querySelector('.eff');
   const pillDot = shadow.querySelector('.dot');
   const pillName = shadow.querySelector('.pname');
+  const pillWant = shadow.querySelector('.pwant');
+  const pillReal = shadow.querySelector('.real');
   const modelLbl = shadow.querySelector('.model .lbl');
   const modelName = shadow.querySelector('.mname');
   const modelMeta = shadow.querySelector('.mmeta');
@@ -528,7 +549,12 @@
     const sent = sentEffort(state.effort, modelById(state.model || ag.model));
     if (sent && ag.reasoningEffort && sent !== ag.reasoningEffort) {
       const e = sent.toUpperCase();
-      out.push(wroteThisThread(ag) ? 'server kept ' + ag.reasoningEffort.toUpperCase() + ', ' + e + ' ignored'
+      // Auto pinned this chat to a model the policy now blocks: the server
+      // re-routes every message at the default effort and refuses to unpin it.
+      const pinned = ag.sticky && ag.sticky.model && state.model && ag.sticky.model !== state.model;
+      out.push(wroteThisThread(ag)
+        ? 'server kept ' + ag.reasoningEffort.toUpperCase() + ', ' + e + ' ignored' +
+          (pinned ? ' (chat pinned to ' + nameOf(ag.sticky.model) + ' by Auto: start a new chat)' : '')
         : e + ' on next message');
     }
     return out.join(' · ');
@@ -543,8 +569,14 @@
     modelMeta.append('id: ' + ag.model + ' · effort ');
     const b = document.createElement('b');
     b.textContent = (ag.reasoningEffort || '?').toUpperCase();
+    const cs = chatStatus();
+    const sw = swapOf(cs);
+    if (sw.effort) b.className = cs.level;
     modelMeta.append(b);
-    const want = pendingText(ag);
+    const want = sw.effort || sw.model
+      ? 'picked ' + [sw.model ? nameOf(state.model) : '', sw.effort ? E(sentEffort(state.effort, modelById(state.model || ag.model))) : '']
+        .filter(Boolean).join(' / ') + (cs.level === 'err' ? ': server swapped it' : ': may not stick')
+      : pendingText(ag);
     if (want) {
       const w = document.createElement('span');
       w.className = 'warn';
@@ -554,6 +586,72 @@
     modelMeta.title = 'thread: ' + ag.thread + '\nselection: ' + ag.modelSelection;
   }
 
+  const E = (x) => (x ? (RANGE_LABELS[x] || x) : '?');
+
+  /** The newest chat send for this thread, as inject.js measured it. */
+  function lastRunFor(thread) {
+    const key = String(thread || '').replace(/-/g, '').toLowerCase();
+    for (let i = runs.length - 1; i >= 0; i--) if (runs[i].thread === key) return runs[i];
+    return null;
+  }
+
+  /**
+   * One verdict for the whole panel, from the chat record and the last send:
+   *   ok   (green)  the chat answered with the picked model and effort
+   *   warn (yellow) works, but not exactly as picked (model limit, pending, risky chat)
+   *   err  (red)    wrong model or effort, or a write failed
+   *   null (grey)   nothing picked / nothing to judge yet
+   */
+  function chatStatus() {
+    const ag = state.agent;
+    const pol = state.policy;
+    const ap = state.agentPref;
+    if (pol && pol.status === 'error') return { level: 'err', text: 'Model not set: ' + ((pol.detail && pol.detail.error) || 'error') };
+    if (!ag || !ag.model) return null;
+    if (ap && ap.status === 'error' && wroteThisThreadId(ap, ag)) {
+      return { level: 'err', text: 'Effort write failed' + (ap.detail && ap.detail.http ? ' (' + ap.detail.http + ')' : '') };
+    }
+    const want = state.model;
+    const wantEff = sentEffort(state.effort, modelById(want || ag.model)) || null;
+    if (!want && !wantEff) return { level: null, text: "Notion's choice: " + nameOf(ag.model) + ' · ' + E(ag.reasoningEffort) };
+    const limited = !!state.effort && !!wantEff && wantEff !== state.effort
+      ? ' (' + E(state.effort) + ' not supported, ' + E(wantEff) + ' used)' : '';
+    const blocked = ag.sticky && ag.sticky.model && want && ag.sticky.model !== want ? ag.sticky.model : null;
+    const run = lastRunFor(ag.thread);
+    const forPick = run && !run.watchOnly && (run.picked || null) === (want || null) && (run.wantEffort || null) === wantEff;
+    if (forPick && !run.ran) return { level: null, text: 'Waiting for the answer…' };
+    if (!forPick) {
+      // Nothing sent with this pick yet: the record says what the next message starts from.
+      const pending = [];
+      if (want && ag.model !== want) pending.push(nameOf(want));
+      if (wantEff && ag.reasoningEffort !== wantEff) pending.push(E(wantEff));
+      if (!pending.length) return { level: limited ? 'warn' : 'ok', text: nameOf(ag.model) + ' · ' + E(ag.reasoningEffort) + limited };
+      if (blocked) {
+        return { level: 'warn', text: 'Swap risk: Auto remembered ' + nameOf(blocked) + ' for this chat (blocked now), so the server may reset ' +
+          E(wantEff) + ' to ' + E(ag.reasoningEffort) + '. Start a new chat' };
+      }
+      return { level: null, text: pending.join(' · ') + ' on next message' };
+    }
+    if (want && run.ran !== want) {
+      return { level: 'err', text: 'Swapped: ' + nameOf(run.ran) + ' answered instead of ' + nameOf(want) };
+    }
+    if (wantEff && run.effort !== wantEff) {
+      return { level: 'err', text: 'Swapped: ' + E(wantEff) + ' → ' + E(run.effort) + ' by the server' +
+        (blocked ? ' (chat remembers ' + nameOf(blocked) + ' from Auto). Start a new chat' : '') };
+    }
+    return { level: limited ? 'warn' : 'ok', text: nameOf(run.ran) + ' · ' + E(run.effort || wantEff) + (limited || ' ✓') };
+  }
+
+  function wroteThisThreadId(ap, ag) {
+    return !!(ap && ap.detail && ag && String(ap.detail.thread || '').replace(/-/g, '') === String(ag.thread || '').replace(/-/g, ''));
+  }
+
+  function paint(el, level) {
+    el.classList.toggle('ok', level === 'ok');
+    el.classList.toggle('warn', level === 'warn');
+    el.classList.toggle('err', level === 'err');
+  }
+
   function renderPill() {
     const ag = state.agent;
     const m = ag && ag.model ? modelById(ag.model) : null;
@@ -561,15 +659,45 @@
     pillEff.textContent = state.effort ? EFFORT_LABELS[state.effort] : 'Auto';
     pillEff.classList.toggle('on', !!state.effort);
 
-    // Green is reserved for server-confirmed, and the server never echoes the
-    // effort back, so this pill deliberately has no success colour to give.
+    // The chat record (thread.agent_provider) echoes model and effort back, so
+    // green means the server ran exactly the pick.
+    const cs = chatStatus();
+    // What runs in this chat differs from the pick: show the pick struck out
+    // and the real value next to it, so a swap reads at a glance.
+    const sw = swapOf(cs);
+    pillWant.classList.toggle('hidden', !sw.model);
+    pillWant.textContent = sw.model ? nameOf(state.model) : '';
+    pillEff.classList.toggle('was', !!sw.effort);
+    pillEff.classList.toggle('on', !!state.effort && !sw.effort);
+    pillReal.classList.toggle('hidden', !sw.effort);
+    pillReal.textContent = sw.effort ? E(ag.reasoningEffort) : '';
+    paint(pillReal, sw.effort && cs ? cs.level : null);
+    if (cs) {
+      paint(pill, cs.level);
+      paint(pillDot, cs.level);
+      pill.title = cs.text || '';
+      return;
+    }
     const v = currentVerdict();
     const st = v && v.effortStatus;
     const bad = (v && v.status === 'error') || st === 'mismatch';
-    pill.classList.toggle('warn', !bad && !!v && !!state.effort);
-    pill.classList.toggle('err', bad);
-    pillDot.classList.toggle('warn', !bad && !!v && !!state.effort);
-    pillDot.classList.toggle('err', bad);
+    paint(pill, bad ? 'err' : v && state.effort ? 'warn' : null);
+    paint(pillDot, bad ? 'err' : v && state.effort ? 'warn' : null);
+  }
+
+  /**
+   * Which parts of the pick the chat is not running. Only once the chat has
+   * answered with this pick (red/yellow) or Auto pinned it elsewhere: before the
+   * first message a different record value is just the old state.
+   */
+  function swapOf(cs) {
+    const ag = state.agent;
+    if (!ag || !ag.model || !cs || (cs.level !== 'err' && cs.level !== 'warn')) return { model: false, effort: false };
+    const wantEff = sentEffort(state.effort, modelById(state.model || ag.model)) || null;
+    return {
+      model: !!state.model && ag.model !== state.model,
+      effort: !!wantEff && !!ag.reasoningEffort && ag.reasoningEffort !== wantEff,
+    };
   }
 
   function renderFoot() {
@@ -587,25 +715,17 @@
       // explicit that the extension's own effort did not reach this chat.
       const ag = state.agent;
       if (ag && (ag.model || ag.reasoningEffort)) {
-        const cur = (ag.reasoningEffort || '?').toUpperCase();
         const ap = state.agentPref;
-        let notOurs = '';
-        const want = pendingText(ag);
-        const now = nameOf(ag.model) + ' · ' + cur;
         const pol = state.policy;
-        const polErr = !!pol && pol.status === 'error';
-        if (polErr) notOurs = 'Model not set: ' + ((pol.detail && pol.detail.error) || 'error');
-        else if (ap && ap.status === 'error') notOurs = 'Effort write failed' + (ap.detail && ap.detail.http ? ' (' + ap.detail.http + ')' : '');
-        else if (want) notOurs = now + ' · ' + want;
-        footTxt.textContent = notOurs ||
-          (state.effort || state.model ? now + ' active in this chat' : "Notion's choice: " + now);
+        const cs = chatStatus() || { level: null, text: nameOf(ag.model) + ' · ' + E(ag.reasoningEffort) };
+        footTxt.textContent = cs.text;
         footTxt.title = 'Set by Notion for this chat (thread.agent_provider)\n' +
           'model: ' + ag.model + '\nselection: ' + ag.modelSelection +
           '\nreasoningEffort: ' + ag.reasoningEffort + '\nthread: ' + ag.thread +
+          (ag.sticky ? '\nAuto pinned to: ' + ag.sticky.model + ' / ' + ag.sticky.reasoningEffort : '') +
           (ap ? '\neffort write: ' + ap.status + ' ' + JSON.stringify(ap.detail || {}) : '') +
           (pol ? '\nallowed models: ' + pol.status + ' ' + JSON.stringify(pol.detail || {}) : '');
-        footDot.classList.toggle('warn', !!notOurs);
-        footDot.classList.toggle('err', polErr || (!!ap && ap.status === 'error'));
+        paint(footDot, cs.level);
         return;
       }
       // Say which of the three it is: nothing AI-like went out at all, it went
@@ -1001,6 +1121,8 @@
       runs = e.data.runs.slice();
       watchOnly = !!e.data.watchOnly;
       renderRuns();
+      renderPill();
+      renderFoot();
     }
 
     if (e.data.type === 'NOTION_EFFORT_TRACE_ALL' && Array.isArray(e.data.entries)) {
@@ -1014,6 +1136,7 @@
         model: e.data.model,
         modelSelection: e.data.modelSelection,
         reasoningEffort: e.data.reasoningEffort,
+        sticky: e.data.sticky || null,
       };
       renderList();
       renderPill();
