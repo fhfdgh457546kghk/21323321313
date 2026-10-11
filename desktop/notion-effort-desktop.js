@@ -379,6 +379,11 @@ async function run() {
         if (!got || !got.text) return send(404, { error: 'no Notion page with the panel found' });
         return send(200, got);
       }
+      if (req.url === '/diag-all') {
+        // Every Notion window keeps its own log: a chat sent from another
+        // window is not in the first page's diag.
+        return send(200, { pages: await readAllDiag(browser) });
+      }
       if (req.url.startsWith('/probe?s=')) {
         const s = decodeURIComponent(req.url.slice(9)).replace(/[^0-9a-f-]/gi, '');
         const got = await evalOnNotion(browser, 'typeof __notionEffortProbeCatalogue === "function" ? __notionEffortProbeCatalogue(' + JSON.stringify(s) + ') : null');
@@ -425,6 +430,28 @@ async function evalOnNotion(browser, expression) {
     }
   }
   return null;
+}
+
+async function readAllDiag(browser) {
+  let targets;
+  try { targets = (await browser.send('Target.getTargets')).targetInfos; } catch (e) { return []; }
+  const pages = (targets || []).filter((t) => t.type === 'page' && /^https:\/\/([a-z0-9-]+\.)?notion\.(so|com)\//.test(t.url));
+  const out = [];
+  for (const t of pages) {
+    let sessionId;
+    try {
+      sessionId = (await browser.send('Target.attachToTarget', { targetId: t.targetId, flatten: true })).sessionId;
+      const r = await withTimeout(browser.send('Runtime.evaluate', {
+        expression: 'typeof __notionEffortAgentDiag === "function" ? __notionEffortAgentDiag() : null', returnByValue: true,
+      }, sessionId), 8000);
+      out.push({ url: t.url, text: (r && r.result && r.result.value) || null });
+    } catch (e) {
+      out.push({ url: t.url, error: e.message });
+    } finally {
+      if (sessionId) browser.send('Target.detachFromTarget', { sessionId }).catch(() => {});
+    }
+  }
+  return out;
 }
 
 async function readDiag(browser) {

@@ -776,6 +776,12 @@ let settings = {
         models: ((json && json.models) || []).map((m) => ({
           model: m.model, provider: m.modelProvider, disabled: !!m.isDisabled,
           restricted: !!m.restrictedForPersonalAgent, config: shortJson(m.modelConfiguration),
+          // Limit-ish flags Notion returns per model: rate-limit headroom and the
+          // disaster-recovery switch, plus the raw card attributes.
+          rateLimit: m.isApproachingRateLimit === undefined ? undefined : !!m.isApproachingRateLimit,
+          outage: m.isDisabledOnlyByDisasterRecovery === undefined ? undefined : !!m.isDisabledOnlyByDisasterRecovery,
+          card: shortJson(m.modelCardAttributes),
+          optIn: shortJson(m.restrictedAccessModelsInPickerConfig),
         })),
         top: shortJson(Object.assign({}, json, { models: undefined })),
       }, null, 2), (e) => JSON.stringify({ error: String(e.message || e) }));
@@ -1201,6 +1207,65 @@ let settings = {
   const PROBE_SKIP = /etClient|trackEvent|\/log|telemetry|sendEventToAgentThread|createAgentThread|runInference|getCompletion|syncRecordValues|getInferenceTranscripts|getThreadTranscript|listenToThreadTranscript/i;
   const PROBE_URL = /model|aiSetting|ai_setting|agentSetting|allowed|restrict/i;
 
+  // ---- Usage limits: percent used and reset time ---------------------------
+  //
+  // Notion does not put the AI usage figures in getAvailableModels; a separate
+  // request carries them. Rather than guess its path, every API response is
+  // scanned for the fields such a payload would have to contain (a percentage
+  // or count, a limit, a reset moment) and the shape is kept here for the
+  // panel. Key names only, no message text: this is a settings payload.
+  const limitLog = [];
+  // Only a response that really looks like a usage/entitlement payload is kept:
+  // a bare "ai_credit_overage_policy" string on the space record is not one.
+  const LIMIT_KEY = /(credit|usage|quota|limit|reset|remaining|entitlement|allowance)/i;
+  const LIMIT_VALUE = /(credit|usage|quota|limit|reset|remaining|entitlement|allowance|window|period|expire)/i;
+  const LIMIT_NUM = /(percent|pct|used|count|consumed|spent|remaining)/i;
+  const LIMIT_SKIP = /etClient|trackEvent|telemetry|getInferenceTranscripts|getThreadTranscript|listenToThreadTranscript|sendEventToAgentThread|createAgentThread|runInference|getCompletion/i;
+
+  function scanLimits(value, path, out, depth) {
+    if (out.length > 60 || depth > 12 || value == null) return;
+    if (Array.isArray(value)) {
+      value.slice(0, 12).forEach((x, i) => scanLimits(x, path + '[' + i + ']', out, depth + 1));
+      return;
+    }
+    if (typeof value !== 'object') return;
+    Object.keys(value).forEach((k) => {
+      const v = value[k];
+      const p = path ? path + '.' + k : k;
+      if (v != null && typeof v !== 'object' && LIMIT_KEY.test(k)) out.push({ path: p, value: typeof v === 'string' && v.length > 60 ? v.slice(0, 60) : v });
+      else scanLimits(v, p, out, depth + 1);
+    });
+  }
+
+  /** Does this response hold numbers in a usage shape, or only policy strings? */
+  function looksLikeUsage(fields) {
+    const numeric = fields.filter((f) => typeof f.value === 'number');
+    if (numeric.length < 2) return false;
+    return numeric.some((f) => LIMIT_NUM.test(f.path));
+  }
+
+  function noteLimits(path, p) {
+    if (LIMIT_SKIP.test(path)) return;
+    p.then((res) => {
+      if (!res || !res.ok) return;
+      const type = (res.headers && res.headers.get && res.headers.get('content-type')) || '';
+      if (type && type.indexOf('json') === -1) return;
+      res.clone().text().then((text) => {
+        let json;
+        try { json = JSON.parse(text); } catch (e) { return; }
+        const out = [];
+        scanLimits(json, '', out, 0);
+        const fields = out.filter((f) => LIMIT_VALUE.test(f.path));
+        if (!fields.length) return;
+        const entry = { at: new Date().toISOString(), url: path, usage: looksLikeUsage(fields), fields: fields.slice(0, 60) };
+        const had = limitLog.some((l) => l.url === path);
+        if (had && !entry.usage) return;
+        logPush(limitLog, entry);
+        console.log('[Notion Effort] usage/limit response:', path, entry.usage ? '(usage-like)' : '(policy only)');
+      }).catch(() => {});
+    }, () => {});
+  }
+
   function noteModelSetting(path, bodyText, p, via) {
     if (PROBE_SKIP.test(path) || bodyText.indexOf('NotionEffort.') !== -1) return;
     const known = settings.knownModels || [];
@@ -1352,6 +1417,14 @@ let settings = {
         name: m.modelMessage || m.displayName || m.name || m.model, // modelMessage is the display name
         family: FAMILY_OF[m.modelFamily] || FAMILY_OF[m.modelProvider] || 'mystery',
         efforts: (m.modelConfiguration && m.modelConfiguration.supportedReasoningEfforts) || [],
+        // The effort the server takes when nothing is written: what a reset
+        // falls back to, so the panel can name the number the reroute picks.
+        defaultEffort: (m.modelConfiguration && m.modelConfiguration.defaultReasoningEffort) || null,
+        // Limit flags Notion returns per model, for the panel's Limits view.
+        rateLimit: m.isApproachingRateLimit === undefined ? undefined : !!m.isApproachingRateLimit,
+        outage: m.isDisabledOnlyByDisasterRecovery === undefined ? undefined : !!m.isDisabledOnlyByDisasterRecovery,
+        disabled: !!m.isDisabled,
+        credit: !!(m.modelCardAttributes && m.modelCardAttributes.billsNotionCredits),
         optIn: isOptIn(m.model),
       })),
     }, '*');
@@ -1519,7 +1592,12 @@ let settings = {
   // A backup left in another workspace is put back only once this account is
   // seen using that workspace: the list may hold a workspace of another
   // account or one no longer reachable (403), and trying it there only fails.
+  // And only on Auto: while a model is picked, every workspace keeps "only the
+  // pick". Putting a list back on each workspace switch changed the policy under
+  // open chats; the server then re-routed them at the default effort (medium)
+  // and, in the gap, Auto pinned new chats to other models for good.
   function strayBackups(sid) {
+    if (settings.model) return [];
     return Object.keys(loadBackups()).filter((k) => k !== plainId(sid) && !failed.has(k) && headersBySpace[k]);
   }
 
@@ -1713,6 +1791,7 @@ let settings = {
       const self = this;
       const p = watch(effortFetch.apply(self, args));
       noteModelSetting(path.replace(location.origin, ''), opts.body, p);
+      noteLimits(path.replace(location.origin, ''), p);
       return p;
     }
     // Before the message goes out: the policy (Auto picks the model for this
@@ -1766,7 +1845,7 @@ let settings = {
   // copy(__notionEffortAgentDiag()) — everything the effort lever knows.
   window.__notionEffortAgentDiag = function () {
     return JSON.stringify({
-      version: '2.25',
+      version: '2.26',
       watchOnly: watchOnly,
       runs: runs,
       url: location.href,
@@ -1804,6 +1883,7 @@ let settings = {
       writes: writeLog,
       foreign: foreignLog,
       modelSettings: modelSettingLog,
+      limitLog: limitLog,
       spaceModelSettings: spaceModelSettings,
     }, null, 2);
   };

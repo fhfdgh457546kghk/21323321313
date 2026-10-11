@@ -48,6 +48,8 @@
     agentPref: null,
     policy: null, // workspace allowed-models write (inject.js applyPolicy)
     spaceModels: null, // codenames the workspace offers (getAvailableModels), null = not read yet
+    spaceInfo: {}, // codename -> limits from the workspace catalogue (efforts, default, flags)
+    limitsOpen: false,
   };
 
   function modelById(id) {
@@ -308,6 +310,18 @@
       .logbody .bad { color: #eb8a86; }
       .logbody .good { color: #7fc99a; }
       .runs { flex: none; border-top: 1px solid rgba(255,255,255,0.08); display: flex; flex-direction: column; max-height: 260px; }
+      .limits { flex: none; border-top: 1px solid rgba(255,255,255,0.08); display: flex; flex-direction: column; max-height: 260px; }
+      .limbody { overflow-y: auto; padding: 0 10px 8px; font-size: 11.5px; color: #c8c8c4; }
+      .limbody .lrow { display: flex; align-items: baseline; gap: 6px; padding: 2px 0; }
+      .limbody .lname { flex: none; max-width: 118px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .limbody .lbar { flex: 1; color: #71716e; font-size: 10.5px; letter-spacing: .02em; }
+      .limbody .lbar b { color: #a9d9bd; font-weight: 600; }
+      .limbody .lbar i { color: #d6a74a; font-style: normal; }
+      .limbody .lflag { flex: none; font-size: 10px; color: #d6a74a; }
+      .limbody .lflag.bad { color: #eb8a86; }
+      .limbody .lgap { color: #71716e; font-size: 10.5px; padding: 2px 0; }
+      .limbar { display: flex; align-items: center; justify-content: space-between; padding: 6px 10px 4px; font-size: 11px; color: #8b8b87; gap: 8px; }
+      .limsum { font-size: 10.5px; color: #8f8f8b; text-align: right; }
       .runsbody { overflow-y: auto; padding: 0 10px 8px; user-select: text; font-size: 12px; color: #c8c8c4; }
       .runsbody .run { padding: 6px 0; border-bottom: 1px solid rgba(255,255,255,0.06); }
       .runsbody .run:last-child { border-bottom: 0; }
@@ -352,10 +366,15 @@
         <div class="logbar"><span>What happened (newest last)</span><button class="logcopy" type="button">Copy</button></div>
         <div class="logbody"></div>
       </div>
+      <div class="limits hidden">
+        <div class="logbar"><span>Limits (workspace catalogue)</span><span class="limsum"></span></div>
+        <div class="limbody"></div>
+      </div>
       <div class="foot">
         <span class="sd"></span>
         <span class="txt">No AI requests seen yet — send a message</span>
         <button class="logbtn chatbtn" type="button" aria-expanded="false">Chat</button>
+        <button class="logbtn limbtn" type="button" aria-expanded="false">Limits</button>
         <button class="logbtn" type="button" aria-expanded="false">Log</button>
       </div>
     </div>
@@ -384,6 +403,10 @@
   const chatBtn = shadow.querySelector('.chatbtn');
   const runsBox = shadow.querySelector('.runs');
   const runsBody = shadow.querySelector('.runsbody');
+  const limBox = shadow.querySelector('.limits');
+  const limBody = shadow.querySelector('.limbody');
+  const limSum = shadow.querySelector('.limsum');
+  const limBtn = shadow.querySelector('.limbtn');
   const watchBox = shadow.querySelector('.watchbox');
   const watchNote = shadow.querySelector('.watchnote');
   let runs = [];
@@ -429,6 +452,99 @@
       runsBody.appendChild(row);
     });
   }
+
+  /** Effort ceiling and flags as the workspace catalogue reported them. */
+  function limitsOf(id) {
+    const info = state.spaceInfo[id];
+    const m = modelById(id);
+    const efforts = info && info.efforts ? info.efforts : m && Array.isArray(m.efforts) ? m.efforts : null;
+    return { info: info || null, efforts: efforts, name: m ? m.name : id };
+  }
+
+  function effortSpan(efforts) {
+    const e = EFFORT_SCALE.filter((x) => (efforts || []).indexOf(x) !== -1);
+    if (!efforts) return 'unknown';
+    if (!efforts.length) return 'no effort';
+    if (!e.length) return efforts.join(', ');
+    return e.length === 1 ? RANGE_LABELS[e[0]] : RANGE_LABELS[e[0]] + '–' + RANGE_LABELS[e[e.length - 1]];
+  }
+
+  /**
+   * One row per model the picker offers: its effort ceiling, the effort the
+   * server picks when nothing is written, and Notion's own limit flags. Marks
+   * the picked model's row and says whether the picked effort clears its ceiling.
+   */
+  function renderLimits() {
+    if (!state.limitsOpen) return;
+    limBody.textContent = '';
+    const offered = state.spaceModels;
+    const rows = MODELS
+      .filter((m) => (!offered || offered.indexOf(m.model) !== -1))
+      .sort((a, b) => (a.family === b.family ? 0 : a.family < b.family ? -1 : 1));
+    let nearLimit = 0;
+    let blocked = 0;
+    if (!rows.length) {
+      limBody.textContent = 'No workspace catalogue read yet. Send a message first.';
+      limSum.textContent = '';
+      return;
+    }
+    rows.forEach((m) => {
+      const L = limitsOf(m.model);
+      const info = L.info || {};
+      const row = document.createElement('div');
+      row.className = 'lrow';
+      const name = document.createElement('span');
+      name.className = 'lname';
+      name.textContent = m.name + (m.model === state.model ? ' (picked)' : '');
+      name.title = m.model;
+      const bar = document.createElement('span');
+      bar.className = 'lbar';
+      // The ceiling, with the default effort named: that is what a reset lands on.
+      bar.append(effortSpan(L.efforts));
+      if (info.defaultEffort) {
+        bar.append(' · default ');
+        const d = document.createElement('b');
+        d.textContent = E(info.defaultEffort);
+        bar.append(d);
+      }
+      const want = state.effort && m.model === (state.model || (state.agent && state.agent.model)) ? state.effort : null;
+      if (want && Array.isArray(L.efforts) && L.efforts.indexOf(want) === -1) {
+        bar.append(' · ');
+        const w = document.createElement('i');
+        w.textContent = E(want) + ' not supported';
+        w.title = 'the nearest lower one is sent instead';
+        bar.append(w);
+      }
+      row.append(name, bar);
+      const flags = [];
+      if (info.rateLimit) { flags.push('near rate limit'); nearLimit++; }
+      if (info.outage) { flags.push('off (Notion outage)'); blocked++; }
+      if (info.disabled) { flags.push('off for this workspace'); blocked++; }
+      if (info.optIn) flags.push('opt-in');
+      if (info.credit) flags.push('uses credits');
+      if (flags.length) {
+        const f = document.createElement('span');
+        f.className = 'lflag' + (info.rateLimit || info.outage || info.disabled ? ' bad' : '');
+        f.textContent = flags.join(', ');
+        row.appendChild(f);
+      }
+      limBody.appendChild(row);
+    });
+    const sums = [];
+    if (nearLimit) sums.push(nearLimit + ' near rate limit');
+    if (blocked) sums.push(blocked + ' unavailable');
+    if (!sums.length) sums.push('all ' + rows.length + ' available');
+    limSum.textContent = sums.join(' · ');
+  }
+
+  limBtn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    state.limitsOpen = !state.limitsOpen;
+    limBtn.setAttribute('aria-expanded', String(state.limitsOpen));
+    limBox.classList.toggle('hidden', !state.limitsOpen);
+    if (state.limitsOpen) window.postMessage({ type: 'NOTION_EFFORT_SPACE_MODELS_REQUEST' }, '*');
+    renderLimits();
+  });
 
   chatBtn.addEventListener('click', (e) => {
     e.stopPropagation();
@@ -1165,9 +1281,18 @@
     }
 
     if (e.data.type === 'NOTION_EFFORT_SPACE_MODELS' && Array.isArray(e.data.models)) {
+      e.data.models.forEach((m) => {
+        if (!m || !m.model) return;
+        state.spaceInfo[m.model] = {
+          efforts: Array.isArray(m.efforts) ? m.efforts : null,
+          defaultEffort: m.defaultEffort || null,
+          rateLimit: m.rateLimit, outage: m.outage, disabled: m.disabled, credit: m.credit, optIn: m.optIn,
+        };
+      });
       state.spaceModels = e.data.models.map((m) => m.model);
       learn(e.data.models.map((m) => Object.assign({ source: 'workspace' }, m)));
       if (state.open) renderList();
+      renderLimits();
     }
 
     if (e.data.type === 'NOTION_EFFORT_CATALOGUE' && Array.isArray(e.data.models)) {
