@@ -270,6 +270,8 @@
       .model .mmeta { margin-top: 2px; font-size: 11px; color: #8b8b87; }
       .model .mmeta b { color: #e9e9e7; font-weight: 600; }
       .model .mmeta .warn { color: #d6a74a; }
+      .model .mmeta .ok { color: #7fc99a; }
+      .model .mmeta .err { color: #eb645f; }
       .foot {
         flex: none;
         border-top: 1px solid rgba(255,255,255,0.08);
@@ -371,7 +373,7 @@
       <div class="mlist"></div>
       <div class="runs hidden">
         <div class="logbar"><span>Which model answered (newest first)</span><label class="watch"><input type="checkbox" class="watchbox"> Watch only</label></div>
-        <div class="watchnote hidden">Watch only: the extension changes nothing. Set the model in Notion Settings → Notion AI → Model controls.</div>
+        <div class="watchnote hidden">Watch only: the extension changes nothing. Old chat: Notion's own menu decides. New chat: Settings → Notion AI → Model controls.</div>
         <div class="runsbody"></div>
       </div>
       <div class="log hidden">
@@ -436,6 +438,11 @@
     runs.slice().reverse().forEach((r) => {
       const row = document.createElement('div');
       row.className = 'run';
+      if (r.legacy) {
+        legacyRow(row, r);
+        runsBody.appendChild(row);
+        return;
+      }
       const top = document.createElement('div');
       top.className = 'rtop';
       const name = document.createElement('span');
@@ -519,7 +526,7 @@
         d.textContent = E(info.defaultEffort);
         bar.append(d);
       }
-      const want = state.effort && m.model === (state.model || (state.agent && state.agent.model)) ? state.effort : null;
+      const want = state.effort && m.model === (state.model || chatModelId()) ? state.effort : null;
       if (want && Array.isArray(L.efforts) && L.efforts.indexOf(want) === -1) {
         bar.append(' · ');
         const w = document.createElement('i');
@@ -639,10 +646,11 @@
       setTimeout(() => { logCopy.textContent = 'Copy'; }, 1200);
     }, () => {});
   });
+  let labelVersion = '';
   try {
-    modelLbl.textContent =
-      'Model in this chat (from Notion server) · v' + chrome.runtime.getManifest().version;
+    labelVersion = ' · v' + chrome.runtime.getManifest().version;
   } catch (e) {}
+  modelLbl.textContent = 'Model in this chat (from Notion server)' + labelVersion;
 
   // ------------------------------------------------------------------ render
 
@@ -671,8 +679,21 @@
   }
 
   function nameOf(id) {
-    const m = modelById(id);
+    const m = modelById(id) || familyOf(id);
     return m ? m.name : id;
+  }
+
+  // An effort variant of a picker model: apricot-sorbet-max is Opus 4.7 (apricot-sorbet-high).
+  const VARIANT_EFFORT = /-(none|minimal|low|medium|high|x-high|xhigh|max)$/;
+  function familyKey(id) {
+    const base = String(id || '').replace(/-(no-)?thinking$/, '');
+    const m = VARIANT_EFFORT.exec(base);
+    return m ? base.slice(0, m.index) : base;
+  }
+  function familyOf(id) {
+    if (!id) return null;
+    const key = familyKey(id);
+    return MODELS.find((m) => m.model && familyKey(m.model) === key) || null;
   }
 
   /** The effort inject.js sends for a pick: the nearest lower one the model takes. */
@@ -706,8 +727,19 @@
   }
 
   function renderModel() {
-    const ag = state.agent;
-    if (!ag || !ag.model) return;
+    const lr = legacyRun();
+    if (lr) {
+      renderLegacyModel(lr);
+      return;
+    }
+    modelLbl.textContent = 'Model in this chat (from Notion server)' + labelVersion;
+    const ag = agentInfo();
+    if (!ag || !ag.model) {
+      modelName.textContent = 'Send a message to see the model';
+      modelMeta.textContent = '';
+      modelMeta.title = '';
+      return;
+    }
     const m = modelById(ag.model);
     modelName.textContent = (m ? m.name : ag.model) + (ag.modelSelection === 'auto' ? ' (Auto)' : '');
     modelMeta.textContent = '';
@@ -736,8 +768,234 @@
   /** The newest chat send for this thread, as inject.js measured it. */
   function lastRunFor(thread) {
     const key = String(thread || '').replace(/-/g, '').toLowerCase();
-    for (let i = runs.length - 1; i >= 0; i--) if (runs[i].thread === key) return runs[i];
+    for (let i = runs.length - 1; i >= 0; i--) if (runs[i].thread === key && !runs[i].legacy) return runs[i];
     return null;
+  }
+
+  // ---------------------------------------------------------------- old chat
+  // inject.js records every old-chat message (runs with legacy: true): what
+  // went out, and which model the server's record of the answer names.
+
+  const plainKey = (id) => String(id || '').replace(/-/g, '').toLowerCase();
+  let pageHref = location.href;
+  let pageSince = Date.now();
+
+  function openChatKey() {
+    try {
+      const t = new URLSearchParams(location.search).get('t');
+      return t ? plainKey(t) : null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function oldChatOn() {
+    try {
+      return localStorage.getItem(OLD_CHAT_KEY) !== 'off';
+    } catch (e) {
+      return true;
+    }
+  }
+
+  /** The newest old-chat message of the chat on screen; null when that chat is an agent chat. */
+  function legacyRun() {
+    const key = openChatKey();
+    if (key) {
+      for (let i = runs.length - 1; i >= 0; i--) if (runs[i].thread === key) return runs[i].legacy ? runs[i] : null;
+    }
+    // A chat whose id is not in the URL (yet): the newest message sent from this page.
+    const r = runs[runs.length - 1];
+    return r && r.legacy && Date.parse(r.at) >= pageSince ? r : null;
+  }
+
+  /** The agent chat record, only while that chat is on screen. */
+  function agentInfo() {
+    const ag = state.agent;
+    const key = openChatKey();
+    return ag && (!key || plainKey(ag.thread) === key) ? ag : null;
+  }
+
+  /** The model the chat on screen runs, for when nothing is picked. */
+  function chatModelId() {
+    const lr = legacyRun();
+    if (lr) return lr.ran || lr.sent || null;
+    const ag = agentInfo();
+    return ag ? ag.model : null;
+  }
+
+  /**
+   * The old chat's verdict: the model named by the server's record of the last
+   * answer, against the model the request asked for.
+   *   ok   (green)  the asked model answered
+   *   warn (yellow) not confirmed, or the effort was lowered to the model's limit
+   *   err  (red)    another model or effort ran, or the server refused
+   *   null (grey)   Auto, in flight, or the pick changed since
+   */
+  function legacyStatus(r) {
+    const pick = watchOnly ? null : state.model || null;
+    const eff = watchOnly ? null : state.effort || null;
+    if ((r.picked || null) !== pick || (r.effortAsked || null) !== eff) {
+      return {
+        level: null, current: false,
+        text: (pick ? nameOf(pick) : "Notion's menu") + ' · effort ' + (eff ? E(eff) : 'Auto') + ' on next message',
+      };
+    }
+    const asked = r.sent ? nameOf(r.sent) : 'Auto';
+    const out = (level, text) => ({ level: level, current: true, text: text });
+    const since = Date.now() - Date.parse(r.at);
+    if (r.status === 'pending') return out(null, 'Sending ' + asked + '… ' + clock(since));
+    if (r.status === 'answering') {
+      // Live: a long think keeps sending data, a stuck answer goes quiet.
+      const who = r.ranSoFar ? nameOf(r.ranSoFar) : asked;
+      const quiet = Date.now() - (r.lastDataAt || Date.parse(r.at));
+      if (quiet > 60000) {
+        return out('warn', who + ': no data from Notion for ' + clock(quiet) + (r.activity ? ' (last step: ' + r.activity + ')' : ''));
+      }
+      return out(null, who + (r.ranSoFar ? ' (named by server)' : '') + ' · ' + (r.activity || 'answering') + ' · ' + clock(since));
+    }
+    if (r.status === 'stopped') {
+      return out(null, 'Stopped after ' + clock((r.endedAt || Date.now()) - Date.parse(r.at)) +
+        (r.activity ? ' · last step: ' + r.activity : '') + (r.ranSoFar ? ' · ' + nameOf(r.ranSoFar) + ' was answering' : ''));
+    }
+    if (r.status === 'error') {
+      return out('err', 'Rejected: ' + asked + (r.http && r.http !== 200 ? ' (HTTP ' + r.http + ')' : '') +
+        (r.error ? ': ' + r.error : ''));
+    }
+    if (r.status === 'unverified') {
+      return out('warn', 'Sent as ' + asked + ', not confirmed: ' +
+        (r.handoff ? "Notion moved the answer to its background queue" : 'the answer did not name its model'));
+    }
+    if (r.status === 'observed') return out(null, 'Auto → ' + nameOf(r.ran) + ' (Notion chose)');
+    if (r.status === 'mismatch') return out('err', 'Swapped: ' + nameOf(r.ran) + ' answered instead of ' + asked);
+    const lowered = r.clampedFrom ? ' (' + E(r.clampedFrom) + ' not supported)'
+      : r.droppedEffort ? ' (' + E(r.droppedEffort) + ' not supported, model default)' : '';
+    const effort = r.effortStatus === 'verified' ? ' · ' + E(r.effort) + ' ✓'
+      : r.effortStatus === 'mismatch' ? ' · ' + E(r.effort) + ' asked, ' + E(r.ranEffort) + ' ran'
+      : r.effortStatus === 'observed' ? ' · ran at ' + E(r.ranEffort)
+      : r.effort ? ' · ' + E(r.effort) + ' sent' : '';
+    return out(r.effortStatus === 'mismatch' ? 'err' : lowered ? 'warn' : 'ok',
+      'Confirmed by server: ' + nameOf(r.ran) + effort + lowered);
+  }
+
+  /** 75000 → "1:15". */
+  function clock(ms) {
+    const s = Math.max(0, Math.round(ms / 1000));
+    return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+  }
+
+  /** Everything the old-chat verdict rests on, for the tooltip. */
+  function legacyDetails(r) {
+    const lines = ['Old chat · message at ' + new Date(r.at).toLocaleTimeString() + (r.isNew ? ' (new chat)' : '')];
+    lines.push('Asked: ' + (r.sent ? nameOf(r.sent) + ' (' + r.sent + ')' + (r.picked ? ' · panel pick' : " · Notion's menu")
+      : 'Auto (the server picks)'));
+    if (r.picked && r.native) lines.push("Notion's menu had: " + nameOf(r.native) + ' (' + r.native + ')');
+    lines.push('Effort sent: ' + (r.effort || 'model default') +
+      (r.clampedFrom ? ' (asked ' + r.clampedFrom + ', model limit)' : '') +
+      (r.droppedEffort ? ' (' + r.droppedEffort + ' dropped, not supported)' : ''));
+    if (r.ranAll && r.ranAll.length) {
+      lines.push('Server record of the answer: ' + r.ranAll.join(', ') + ' · ' + r.steps + ' agent-inference step(s)' +
+        (r.traceMatched ? ', same traceId as the request' : ''));
+    }
+    if (r.ranEffort) lines.push('Effort in the model id: ' + r.ranEffort);
+    if (r.frames) {
+      lines.push('Stream: ' + r.frames + ' frames' + (r.lastDataAt ? ', last ' + clock(Date.now() - r.lastDataAt) + ' ago' : '') +
+        (r.activity ? ' · last step: ' + r.activity : ''));
+    }
+    if (r.handoff) lines.push("Moved to Notion's background queue: the rest arrives through the chat record");
+    if (r.http) lines.push('HTTP ' + r.http);
+    if (r.error) lines.push('Error: ' + r.error);
+    if (r.watchOnly) lines.push('Watch only: sent as Notion built it');
+    return lines.join('\n');
+  }
+
+  function renderLegacyModel(r) {
+    modelLbl.textContent = 'Model that answered (from Notion server)' + labelVersion;
+    const waiting = r.status === 'pending' || r.status === 'answering';
+    modelName.textContent = r.ran ? nameOf(r.ran)
+      : waiting && r.ranSoFar ? nameOf(r.ranSoFar) + ' (answering…)'
+      : waiting ? 'Waiting for the answer…' : 'Not named by the server';
+    modelMeta.textContent = '';
+    modelMeta.append((r.ran || r.ranSoFar ? 'id: ' + (r.ran || r.ranSoFar) + ' · ' : '') + 'old chat');
+    if (r.tokensIn || r.tokensOut) modelMeta.append(' · tokens ' + (r.tokensIn || 0) + ' in / ' + (r.tokensOut || 0) + ' out');
+    if (r.picked && r.native && familyKey(r.native) !== familyKey(r.picked)) {
+      modelMeta.append(" · Notion's menu: " + nameOf(r.native) + ', not used');
+    }
+    const badge = {
+      verified: ['ok', 'the model asked for ✓'],
+      mismatch: ['err', 'asked ' + nameOf(r.sent)],
+      unverified: ['warn', 'not confirmed'],
+      error: ['err', 'error'],
+    }[r.status];
+    if (badge) {
+      const s = document.createElement('span');
+      s.className = badge[0];
+      s.textContent = ' · ' + badge[1];
+      modelMeta.append(s);
+    }
+    modelMeta.title = legacyDetails(r);
+  }
+
+  function renderLegacyPill(r) {
+    const cs = legacyStatus(r);
+    const shown = cs.current ? r.ran || r.sent : state.model;
+    pillName.textContent = shown ? nameOf(shown) : 'Auto';
+    pillEff.textContent = state.effort ? EFFORT_LABELS[state.effort] : 'Auto';
+    // A swap reads at a glance: the pick struck out, the real value next to it.
+    const swapModel = cs.current && r.status === 'mismatch';
+    const swapEffort = cs.current && r.effortStatus === 'mismatch';
+    pillWant.classList.toggle('hidden', !swapModel);
+    pillWant.textContent = swapModel ? nameOf(r.sent) : '';
+    pillEff.classList.toggle('was', swapEffort);
+    pillEff.classList.toggle('on', !!state.effort && !swapEffort);
+    pillReal.classList.toggle('hidden', !swapEffort);
+    pillReal.textContent = swapEffort ? E(r.ranEffort) : '';
+    paint(pillReal, swapEffort ? 'err' : null);
+    paint(pill, cs.level);
+    paint(pillDot, cs.level);
+    pill.title = cs.text;
+  }
+
+  function renderLegacyFoot(r) {
+    const cs = legacyStatus(r);
+    footTxt.textContent = cs.text;
+    footTxt.title = legacyDetails(r);
+    paint(footDot, cs.level);
+  }
+
+  function legacyRow(row, r) {
+    const top = document.createElement('div');
+    top.className = 'rtop';
+    const name = document.createElement('span');
+    name.className = 'rname';
+    const waiting = r.status === 'pending' || r.status === 'answering';
+    name.textContent = r.ran ? nameOf(r.ran) + (r.ranEffort ? ' · ' + r.ranEffort : '')
+      : waiting ? (r.ranSoFar ? nameOf(r.ranSoFar) + ' · ' : '') + (r.activity || 'waiting for the answer') + '…'
+      : r.status === 'error' ? 'error' : r.status === 'stopped' ? 'stopped' : 'model not named';
+    const time = document.createElement('span');
+    time.className = 'rtime';
+    time.textContent = new Date(r.at).toLocaleTimeString() + (r.isNew ? ' · new chat' : '') + ' · old chat';
+    top.append(name, time);
+    const sub = document.createElement('div');
+    sub.className = 'rsub';
+    sub.textContent = (r.ran && nameOf(r.ran) !== r.ran ? 'id ' + r.ran + ' · ' : '') +
+      'asked ' + (r.sent ? nameOf(r.sent) + (r.picked ? ' (panel)' : " (Notion's menu)") : 'Auto') +
+      (r.picked && r.native && r.native !== r.picked ? ' · menu had ' + nameOf(r.native) : '') +
+      ' · effort sent ' + (r.effort || 'default') + (r.watchOnly ? ' · watch only' : '');
+    row.append(top, sub);
+    const verdict = {
+      verified: ['ok', 'Server confirmed: ' + nameOf(r.ran) + ' ✓'],
+      mismatch: ['no', 'Server ran ' + nameOf(r.ran) + ', not ' + nameOf(r.sent)],
+      observed: ['', 'Auto: Notion chose ' + nameOf(r.ran)],
+      unverified: ['', 'The answer did not name its model'],
+      error: ['no', 'Error' + (r.http && r.http !== 200 ? ' HTTP ' + r.http : '') + (r.error ? ': ' + r.error : '')],
+      stopped: ['', 'Stopped'],
+    }[r.status];
+    if (verdict) {
+      const v = document.createElement('div');
+      v.className = 'rsub' + (verdict[0] ? ' ' + verdict[0] : '');
+      v.textContent = verdict[1] + (r.effortStatus === 'mismatch' ? ' · effort ' + r.effort + ' → ' + r.ranEffort : '');
+      row.appendChild(v);
+    }
   }
 
   /**
@@ -748,7 +1006,7 @@
    *   null (grey)   nothing picked / nothing to judge yet
    */
   function chatStatus() {
-    const ag = state.agent;
+    const ag = agentInfo();
     const pol = state.policy;
     const ap = state.agentPref;
     if (pol && pol.status === 'error') return { level: 'err', text: 'Model not set: ' + ((pol.detail && pol.detail.error) || 'error') };
@@ -798,7 +1056,12 @@
   }
 
   function renderPill() {
-    const ag = state.agent;
+    const lr = legacyRun();
+    if (lr) {
+      renderLegacyPill(lr);
+      return;
+    }
+    const ag = agentInfo();
     const m = ag && ag.model ? modelById(ag.model) : null;
     pillName.textContent = m ? m.name : ag && ag.model ? ag.model : 'Effort';
     pillEff.textContent = state.effort ? EFFORT_LABELS[state.effort] : 'Auto';
@@ -823,6 +1086,7 @@
       pill.title = cs.text || '';
       return;
     }
+    pill.title = '';
     const v = currentVerdict();
     const st = v && v.effortStatus;
     const bad = (v && v.status === 'error') || st === 'mismatch';
@@ -836,7 +1100,7 @@
    * first message a different record value is just the old state.
    */
   function swapOf(cs) {
-    const ag = state.agent;
+    const ag = agentInfo();
     if (!ag || !ag.model || !cs || (cs.level !== 'err' && cs.level !== 'warn')) return { model: false, effort: false };
     const wantEff = sentEffort(state.effort, modelById(state.model || ag.model)) || null;
     return {
@@ -847,6 +1111,11 @@
 
   function renderFoot() {
     renderModel();
+    const lr = legacyRun();
+    if (lr) {
+      renderLegacyFoot(lr);
+      return;
+    }
     const v = currentVerdict();
     footDot.classList.toggle('err', !!v && (v.status === 'error' || v.effortStatus === 'mismatch'));
     footDot.classList.toggle(
@@ -854,11 +1123,12 @@
       !!v && v.status !== 'error' && v.effortStatus !== 'mismatch' && !!v.effort
     );
 
-    if (!v || state.agent) {
+    const agNow = agentInfo();
+    if (!v || agNow) {
       // New agent chat: no request carries the model, but the thread record
       // says what the server assigned. Report it as Notion's choice, and be
       // explicit that the extension's own effort did not reach this chat.
-      const ag = state.agent;
+      const ag = agNow;
       if (ag && (ag.model || ag.reasoningEffort)) {
         const ap = state.agentPref;
         const pol = state.policy;
@@ -984,7 +1254,7 @@
 
   /** Efforts the picked (or running) model takes; null = unknown, anything goes. */
   function modelEfforts() {
-    const m = modelById(state.model || (state.agent && state.agent.model));
+    const m = modelById(state.model || chatModelId());
     return m && Array.isArray(m.efforts) ? m.efforts : null;
   }
 
@@ -1006,7 +1276,9 @@
       bad = true;
       msg = 'Could not set allowed models: ' + ((pol.detail && pol.detail.error) || 'error');
     } else if (state.model) {
-      msg = 'Workspace allows only ' + nameOf(state.model) + '. Auto restores your list.';
+      msg = oldChatOn()
+        ? nameOf(state.model) + ' goes with every old-chat message; for new chats the workspace allows only it. Auto restores your list.'
+        : 'Workspace allows only ' + nameOf(state.model) + '. Auto restores your list.';
     }
     const r = state.restore;
     if (r && r.status === 'error') {
@@ -1022,7 +1294,7 @@
     mlist.textContent = '';
     const labels = globalThis.NOTION_EFFORT_FAMILY_LABELS || {};
     const order = globalThis.NOTION_EFFORT_FAMILY_ORDER || [];
-    const running = state.agent && state.agent.model;
+    const running = chatModelId();
     const offered = state.spaceModels;
     const q = normName(search.value);
     const usable = MODELS.filter((m) => !m.restricted && (!offered || offered.indexOf(m.model) !== -1))
@@ -1091,7 +1363,7 @@
       b.addEventListener('click', () => selectEffort(id));
       seg.appendChild(b);
     });
-    const m = modelById(state.model || (state.agent && state.agent.model));
+    const m = modelById(state.model || chatModelId());
     let note = '';
     if (m && allowed && state.effort && allowed.indexOf(state.effort) === -1) {
       note = allowed.length
@@ -1109,13 +1381,23 @@
 
   // ----------------------------------------------------------------- actions
 
+  // useContextualCoreDocsAutoLoad / useDocPreviewsForCoreAutoLoad: Notion's own
+  // client sends them only from internal overrides, so forcing them is opt-in.
+  function maxIntelligenceOn() {
+    try {
+      return localStorage.getItem('notionEffort.maxIntelligence') === 'on';
+    } catch (e) {
+      return false;
+    }
+  }
+
   function pushSettings() {
     window.postMessage(
       {
         type: 'NOTION_EFFORT_SETTINGS',
         effort: state.effort,
         model: state.model,
-        maxIntelligence: true,
+        maxIntelligence: maxIntelligenceOn(),
         // Lets the response scanner tell a real model id from arbitrary strings
         // that merely sit under a "model"-ish key.
         knownModels: MODELS.map((m) => m.model).filter(Boolean),
@@ -1390,6 +1672,21 @@
     renderFoot();
     position();
   });
+
+  // Another chat on screen (SPA navigation): show its verdict, not the last one.
+  // While an old-chat answer streams, the clock and the quiet time tick on.
+  setInterval(() => {
+    const moved = location.href !== pageHref;
+    if (moved) {
+      pageHref = location.href;
+      pageSince = Date.now();
+    }
+    const lr = legacyRun();
+    if (!moved && !(lr && (lr.status === 'pending' || lr.status === 'answering'))) return;
+    renderPill();
+    renderFoot();
+    if (moved && state.open) renderList();
+  }, 1000);
 
   function mount() {
     if (!document.body || host.isConnected) return;

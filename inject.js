@@ -22,7 +22,7 @@
 let settings = {
   effort: null,
   model: null,
-  maxIntelligence: true,
+  maxIntelligence: false,
   knownModels: [],
   effortsByModel: {},
 };
@@ -52,7 +52,7 @@ let settings = {
       if (before !== (settings.model || 'auto') + '/' + (settings.effort || 'auto')) {
         setTimeout(() => trace('pick', 'model ' + modelLabel(settings.model) + ' · effort ' + (settings.effort || 'Auto')), 0);
       }
-      settings.maxIntelligence = e.data.maxIntelligence !== false;
+      if ('maxIntelligence' in e.data) settings.maxIntelligence = e.data.maxIntelligence === true;
       if (Array.isArray(e.data.knownModels) && e.data.knownModels.length) {
         settings.knownModels = e.data.knownModels;
       }
@@ -407,6 +407,12 @@ let settings = {
     return null;
   }
 
+  /** The old chat's own send: a "workflow" config that is not a custom agent or the writer. */
+  function isChatConfig(cfg) {
+    return cfg.type === 'workflow' && !cfg.isCustomAgent && !cfg.isCustomAgentBuilder &&
+      !cfg.isCustomAgentCreate && !cfg.isDatabaseAgent && !cfg.writerMode;
+  }
+
   /** Fallback: any object that already carries an effort field. */
   function findEffortHolder(node, path, depth) {
     if (!node || typeof node !== 'object' || depth > 8) return null;
@@ -453,11 +459,27 @@ let settings = {
       })(),
     };
 
-    // Whatever model Notion's own menu picked is the model that runs.
-    const activeModel = reqModel ? reqModel.id : null;
-    const requestedEffort = settings.effort;
+    // Old chat: the panel's model goes into the request. Anything else (custom
+    // agents, the writer, Notion's own helpers) keeps the model Notion chose.
+    const chat = !target.key && isChatConfig(cfg);
+    const nativeModel = reqModel ? reqModel.id : null;
+    const pick = chat && !watchOnly ? settings.model : null;
     let clampedFrom = null;
+    let droppedEffort = null;
     let modified = false;
+    if (pick && (cfg.model !== pick || cfg.modelFromUser !== true)) {
+      cfg.model = pick;
+      // Without modelFromUser the server treats the send as Auto and picks the model itself.
+      cfg.modelFromUser = true;
+      modified = true;
+    }
+    if (pick && pick !== nativeModel && body.expectedFundingRoute === 'chatgpt') {
+      // Only Notion's own OpenAI pick can be billed to a connected ChatGPT account.
+      body.expectedFundingRoute = 'ordinary';
+      modified = true;
+    }
+    const activeModel = pick || nativeModel;
+    const requestedEffort = watchOnly ? null : settings.effort;
 
     // Safety net: if Notion moved to a model we have never seen, we have no
     // effort ceiling for it, so the clamp below is skipped and the ask goes
@@ -480,10 +502,18 @@ let settings = {
       cfg[effortKey] = targetEffort;
       modified = true;
     }
+    // Notion chose its effort for its own model. One the picked model does not
+    // take makes the server drop the pick, so it goes and the model default applies.
+    if (pick && !targetEffort && cfg[effortKey] && Array.isArray(supported) &&
+        supported.indexOf(cfg[effortKey]) === -1) {
+      droppedEffort = cfg[effortKey];
+      delete cfg[effortKey];
+      modified = true;
+    }
 
     // Only meaningful on the classic config step; not invented on some other
     // object that merely happens to hold an effort field.
-    if (settings.maxIntelligence && !target.key) {
+    if (settings.maxIntelligence && !target.key && !watchOnly) {
       if (cfg.useContextualCoreDocsAutoLoad !== true) {
         cfg.useContextualCoreDocsAutoLoad = true;
         modified = true;
@@ -496,10 +526,26 @@ let settings = {
 
     const sentModel = activeModel;
     const sentEffort = cfg[effortKey] || null;
+    // For the old-chat record: the model the server is asked for (null = Auto).
+    const chatInfo = chat
+      ? {
+          chat: true,
+          pick: pick,
+          nativeModel: nativeModel,
+          explicit: cfg.modelFromUser === true && typeof cfg.model === 'string' ? cfg.model : null,
+          effortOut: sentEffort,
+          requestedEffort: requestedEffort,
+          clampedFrom: clampedFrom,
+          droppedEffort: droppedEffort,
+          threadId: typeof body.threadId === 'string' ? body.threadId : null,
+          traceId: typeof body.traceId === 'string' ? body.traceId : null,
+          isNew: body.createThread === true,
+        }
+      : { chat: false };
 
     if (!modified) {
       window.__notionEffortDebug = { incoming: incoming, request: null };
-      return { modified: false, sentModel: sentModel, sentEffort: null };
+      return Object.assign({ modified: false, sentModel: sentModel, sentEffort: null }, chatInfo);
     }
 
     swappedCount++;
@@ -531,9 +577,12 @@ let settings = {
         stale: requestFields.filter((f) => f.value !== sentModel).map(plainField),
         effortFields: requestEffortFields.map(plainField),
         effortInModelId: suffix ? suffix[1] : null,
+        pickedModel: pick,
+        nativeModel: nativeModel,
+        modelFromUser: cfg.modelFromUser === true,
       },
     };
-    return { modified: true, sentModel: sentModel, sentEffort: sentEffort };
+    return Object.assign({ modified: true, sentModel: sentModel, sentEffort: sentEffort }, chatInfo);
   }
 
   function urlOf(input) {
@@ -599,21 +648,28 @@ let settings = {
       return originalFetch.apply(this, args);
     }
     noteSeen(url, 'fetch', result.modified ? 'patched' : 'already matched');
+    // Old chat: one record per message, judged by the answer itself.
+    const run = result.chat ? startLegacyRun(result) : null;
 
     if (!result.modified) {
       // No swap (Auto, or the body already matched). Still read the answer so
       // a server-side allowlist can be tested with the extension standing down.
-      const passthrough = await originalFetch.apply(this, args);
-      if (passthrough.ok) verifyResponseModel(passthrough, result.sentModel, null, true);
+      const passthrough = await whileSending(run, originalFetch.apply(this, args));
+      if (run) finishLegacyRun(run, passthrough);
+      else if (passthrough.ok) verifyResponseModel(passthrough, result.sentModel, null, true);
       return passthrough;
     }
 
     const newText = JSON.stringify(body);
-    notifyApplied(result.sentModel, result.sentEffort, 'pending');
+    if (!run) notifyApplied(result.sentModel, result.sentEffort, 'pending');
 
-    const response = await (input instanceof Request
+    const response = await whileSending(run, input instanceof Request
       ? originalFetch(new Request(input, Object.assign({}, options || {}, { body: newText })))
       : originalFetch(input, Object.assign({}, options, { body: newText })));
+    if (run) {
+      finishLegacyRun(run, response);
+      return response;
+    }
 
     notifyApplied(
       result.sentModel,
@@ -658,14 +714,18 @@ let settings = {
           'xhr',
           !result ? 'no config / reasoningEffort in body' : result.modified ? 'patched' : 'already matched'
         );
+        const run = result && result.chat ? startLegacyRun(result) : null;
+        const xhr = this;
+        if (run) xhr.addEventListener('loadend', () => finishLegacyXhr(run, xhr));
         if (result && result.modified) {
           data = JSON.stringify(body);
-          notifyApplied(result.sentModel, result.sentEffort, 'pending');
-          const xhr = this;
-          xhr.addEventListener('loadend', () => {
-            const ok = xhr.status >= 200 && xhr.status < 300;
-            notifyApplied(result.sentModel, result.sentEffort, ok ? 'ok' : 'error', ok ? null : xhr.status);
-          });
+          if (!run) {
+            notifyApplied(result.sentModel, result.sentEffort, 'pending');
+            xhr.addEventListener('loadend', () => {
+              const ok = xhr.status >= 200 && xhr.status < 300;
+              notifyApplied(result.sentModel, result.sentEffort, ok ? 'ok' : 'error', ok ? null : xhr.status);
+            });
+          }
         }
       }
     } catch (e) {}
@@ -1685,6 +1745,386 @@ let settings = {
     }
   }
 
+  // ---- Old chat: which model really answered -------------------------------
+  //
+  // The old chat names its model in the request (config step: model +
+  // modelFromUser) and answers with JSON lines: patch-start / patch-sync carry
+  // the run's steps as data.s, patch carries compact JSON-patch ops on them
+  // ({o, p, v, f, r}), record-map carries the saved thread_message records.
+  // Every agent-inference step records the model that produced it and the
+  // run's traceId (Notion's own debug view prints both), so the verdict rests
+  // on the server's record of the answer, not on what was sent.
+
+  function startLegacyRun(r) {
+    const run = {
+      legacy: true, at: new Date().toISOString(), thread: r.threadId ? plainId(r.threadId) : null, isNew: r.isNew,
+      watchOnly: watchOnly, picked: r.pick || null, native: r.nativeModel || null, sent: r.explicit || null,
+      effort: r.effortOut || null, effortAsked: r.requestedEffort || null,
+      clampedFrom: r.clampedFrom || null, droppedEffort: r.droppedEffort || null,
+      traceId: r.traceId || null, status: 'pending', http: null, error: null,
+      ran: null, ranAll: [], ranEffort: null, effortStatus: null, steps: 0, traceMatched: false,
+      tokensIn: null, tokensOut: null,
+    };
+    runs.push(run);
+    if (runs.length > 30) runs.shift();
+    trace('old chat', (run.isNew ? 'new chat' : 'chat ' + (run.thread || '?').slice(0, 8)) + ' · ask ' +
+      (run.sent ? modelLabel(run.sent) + (run.picked ? ' (panel)' : " (Notion's menu)") : 'Auto') +
+      (run.picked && run.native && run.native !== run.picked ? ", Notion's menu had " + modelLabel(run.native) : '') +
+      ' · effort ' + (run.effort || 'model default') +
+      (run.clampedFrom ? ' (' + run.clampedFrom + ' not supported)' : '') +
+      (run.droppedEffort ? ' (' + run.droppedEffort + ' dropped: not supported)' : '') +
+      (run.watchOnly ? ' · watch only: sent as is' : ''));
+    publishRuns();
+    return run;
+  }
+
+  function whileSending(run, promise) {
+    if (run) promise.catch((e) => failLegacyRun(run, e));
+    return promise;
+  }
+
+  function failLegacyRun(run, e) {
+    run.status = e && e.name === 'AbortError' ? 'stopped' : 'error';
+    run.error = String((e && e.message) || e).slice(0, 160);
+    run.endedAt = Date.now();
+    trace('old chat', (run.status === 'stopped' ? 'stopped' : 'FAILED: ' + run.error) + legacyWhere(run));
+    publishRuns();
+  }
+
+  /** Where a run got to, for the log: a stop or a stall reads as "working" or "stuck". */
+  function legacyWhere(run) {
+    const end = run.endedAt || Date.now();
+    const secs = (ms) => Math.round(ms / 1000) + ' s';
+    return ' after ' + secs(end - Date.parse(run.at)) +
+      (run.lastDataAt ? ' · last data ' + secs(end - run.lastDataAt) + ' before' : ' · no data received') +
+      (run.activity ? ' · last step: ' + run.activity : '') + (run.frames ? ' · ' + run.frames + ' frames' : '');
+  }
+
+  function finishLegacyRun(run, response) {
+    run.http = response.status;
+    if (!response.ok) {
+      run.status = 'error';
+      run.endedAt = Date.now();
+      trace('old chat', 'FAILED: HTTP ' + response.status);
+      publishRuns();
+      return;
+    }
+    let copy;
+    try {
+      copy = response.clone();
+    } catch (e) {
+      run.status = 'unverified';
+      publishRuns();
+      return;
+    }
+    run.status = 'answering';
+    publishRuns();
+    // Read the copy as it streams: the panel shows whether data still arrives
+    // and what the run is doing, so a long think and a stuck answer differ.
+    const answer = legacyReader();
+    if (!copy.body) {
+      judgeLegacyRun(run, answer.result());
+      return;
+    }
+    const reader = copy.body.getReader();
+    const decoder = new TextDecoder();
+    let rest = '';
+    let shown = 0;
+    const pump = () => reader.read().then((chunk) => {
+      if (chunk.value) {
+        const lines = (rest + decoder.decode(chunk.value, { stream: true })).split('\n');
+        rest = lines.pop();
+        lines.forEach(answer.push);
+        run.lastDataAt = Date.now();
+        if (run.lastDataAt - shown > 700) {
+          shown = run.lastDataAt;
+          noteLegacyProgress(run, answer.result());
+        }
+      }
+      if (!chunk.done) return pump();
+      answer.push(rest + decoder.decode());
+      return judgeLegacyRun(run, answer.result());
+    });
+    pump().catch((e) => {
+      noteLegacyProgress(run, answer.result(), true);
+      failLegacyRun(run, e);
+    });
+  }
+
+  function finishLegacyXhr(run, xhr) {
+    run.http = xhr.status;
+    if (xhr.status < 200 || xhr.status >= 300) {
+      run.status = xhr.status ? 'error' : 'stopped';
+      run.endedAt = Date.now();
+      if (xhr.status) trace('old chat', 'FAILED: HTTP ' + xhr.status);
+      publishRuns();
+      return;
+    }
+    let text = '';
+    try { text = String(xhr.responseText || ''); } catch (e) {}
+    judgeLegacyRun(run, readLegacyAnswer(text));
+  }
+
+  /** Steps of this very run; when none carry its traceId, all the answer carried. */
+  function namedSteps(run, answer) {
+    const own = run.traceId ? answer.steps.filter((s) => s.traceId === run.traceId) : [];
+    return { own: own.length > 0, named: (own.length ? own : answer.steps).filter((s) => s.model) };
+  }
+
+  function noteLegacyProgress(run, answer, quiet) {
+    run.frames = answer.frames;
+    run.activity = answer.activity || run.activity || null;
+    const named = namedSteps(run, answer).named;
+    run.ranSoFar = named.length ? named[named.length - 1].model : run.ranSoFar || null;
+    if (answer.handoff && !run.handoff) {
+      run.handoff = true;
+      trace('old chat', 'Notion moved the answer to its background queue: the rest comes through the chat record, not this stream');
+    }
+    if (!quiet) publishRuns();
+  }
+
+  const PATCH_OPS = { a: 'add', r: 'remove', p: 'replace', m: 'move', c: 'copy', t: 'test', x: 'append', s: 'replaceSuffix' };
+  const BAD_KEY = /^(__proto__|constructor|prototype)$/;
+  const INDEX = /^\d+$/;
+
+  function pointerOf(path) {
+    return path === '' ? [] : String(path).split('/').slice(1).map((t) => t.replace(/~1/g, '/').replace(/~0/g, '~'));
+  }
+
+  function childOf(node, key) {
+    if (Array.isArray(node)) return INDEX.test(key) ? node[Number(key)] : undefined;
+    return node && typeof node === 'object' && !BAD_KEY.test(key) ? node[key] : undefined;
+  }
+
+  /** The container that holds the last token of path, or null. */
+  function parentOf(doc, path) {
+    let node = doc;
+    for (const key of path.slice(0, -1)) {
+      node = childOf(node, key);
+      if (!node || typeof node !== 'object') return null;
+    }
+    return node;
+  }
+
+  function putAt(parent, key, value, insert) {
+    if (Array.isArray(parent)) {
+      const i = key === '-' ? parent.length : INDEX.test(key) ? Number(key) : -1;
+      if (i < 0 || i > parent.length) return false;
+      if (insert) parent.splice(i, 0, value);
+      else parent[i] = value;
+      return true;
+    }
+    if (BAD_KEY.test(key)) return false;
+    parent[key] = value;
+    return true;
+  }
+
+  function takeAt(parent, key) {
+    if (Array.isArray(parent)) {
+      return INDEX.test(key) && Number(key) < parent.length ? parent.splice(Number(key), 1)[0] : undefined;
+    }
+    if (BAD_KEY.test(key) || !Object.prototype.hasOwnProperty.call(parent, key)) return undefined;
+    const value = parent[key];
+    delete parent[key];
+    return value;
+  }
+
+  function sameJson(a, b) {
+    if (a === b) return true;
+    if (!a || !b || typeof a !== 'object' || typeof b !== 'object' || Array.isArray(a) !== Array.isArray(b)) return false;
+    const keys = Object.keys(a);
+    return keys.length === Object.keys(b).length &&
+      keys.every((k) => Object.prototype.hasOwnProperty.call(b, k) && sameJson(a[k], b[k]));
+  }
+
+  /** One op of Notion's patch stream applied to doc, as its client does; false = lost track. */
+  function applyPatchOp(doc, op) {
+    const kind = op && PATCH_OPS[op.o];
+    if (!kind) return false;
+    const path = pointerOf(op.p == null ? '' : op.p);
+    if (kind === 'test') {
+      if (!path.length) return sameJson(doc, op.v);
+      const holder = parentOf(doc, path);
+      return !!holder && sameJson(childOf(holder, path[path.length - 1]), op.v);
+    }
+    if (!path.length) return false;
+    const key = path[path.length - 1];
+    let value = op.v;
+    if (kind === 'move' || kind === 'copy') {
+      const from = pointerOf(op.f == null ? '' : op.f);
+      const holder = from.length ? parentOf(doc, from) : null;
+      if (!holder) return false;
+      value = kind === 'move' ? takeAt(holder, from[from.length - 1]) : childOf(holder, from[from.length - 1]);
+      if (value === undefined) return false;
+      if (kind === 'copy') value = JSON.parse(JSON.stringify(value));
+    }
+    // After a move's removal: the target path is read against the new state.
+    const parent = parentOf(doc, path);
+    if (!parent) return false;
+    if (kind === 'remove') return takeAt(parent, key) !== undefined;
+    if (kind === 'replace') return childOf(parent, key) !== undefined && putAt(parent, key, value, false);
+    if (kind === 'append') {
+      const cur = childOf(parent, key);
+      return typeof cur === 'string' && typeof value === 'string' && putAt(parent, key, cur + value, false);
+    }
+    if (kind === 'replaceSuffix') {
+      const list = childOf(parent, key);
+      const n = op.r;
+      if (!Array.isArray(list) || !Array.isArray(value) || !Number.isInteger(n) || n < 0 || n > list.length) return false;
+      list.splice(list.length - n, n, ...value);
+      return true;
+    }
+    return putAt(parent, key, value, true); // add, move, copy
+  }
+
+  function collectInference(node, out, depth) {
+    if (!node || typeof node !== 'object' || depth > 10) return;
+    if (!Array.isArray(node) && node.type === 'agent-inference') {
+      out.push(node);
+      return;
+    }
+    for (const key of Object.keys(node)) collectInference(node[key], out, depth + 1);
+  }
+
+  /** What the run is doing now, from its last step. */
+  function activityOf(s) {
+    const last = s[s.length - 1];
+    if (!last || typeof last !== 'object') return null;
+    if (last.type === 'agent-inference') {
+      const parts = Array.isArray(last.value) ? last.value : [];
+      const part = parts[parts.length - 1] || {};
+      if (part.type === 'thinking') return 'thinking';
+      if (part.type === 'registered_tool_use' || part.type === 'tool_use') return 'calling ' + String(part.name || 'a tool').slice(0, 40);
+      if (part.type === 'text') return 'writing the answer';
+      return 'model step';
+    }
+    if (last.type === 'agent-tool-result') return 'after tool ' + String(last.toolName || last.toolType || '?').slice(0, 40);
+    return String(last.type || '?').slice(0, 40);
+  }
+
+  /** Reads an old-chat answer line by line, rebuilding the run's steps the way Notion does. */
+  function legacyReader() {
+    let doc = { s: [] };
+    let lost = false; // a patch that did not apply: the state is unknown until the next patch-sync
+    let frames = 0;
+    let handoff = false;
+    const found = [];
+    const errors = [];
+    return {
+      push(line) {
+        if (!line || !line.trim()) return;
+        let msg;
+        try {
+          msg = JSON.parse(line);
+        } catch (e) {
+          return;
+        }
+        if (!msg || typeof msg !== 'object') return;
+        frames++;
+        if ((msg.type === 'patch-start' || msg.type === 'patch-sync') && msg.data && Array.isArray(msg.data.s)) {
+          doc = { s: msg.data.s };
+          lost = false;
+        } else if (msg.type === 'patch' && Array.isArray(msg.v)) {
+          for (let i = 0; i < msg.v.length && !lost; i++) lost = !applyPatchOp(doc, msg.v[i]);
+        } else if (msg.type === 'record-map') {
+          collectInference(msg.recordMap, found, 0);
+        } else if (msg.type === 'agent-inference') {
+          found.push(msg);
+        } else if (msg.type === 'error') {
+          errors.push(msg);
+        } else if (msg.type === 'queue-handoff') {
+          handoff = true;
+        }
+      },
+      result() {
+        const s = !lost && Array.isArray(doc.s) ? doc.s : [];
+        const all = found.concat(s.filter((step) => step && step.type === 'agent-inference'));
+        const errs = errors.concat(s.filter((step) => step && step.type === 'error'));
+        // The same step can arrive in the patch state and as its saved record.
+        const byId = new Map();
+        const steps = [];
+        all.forEach((x) => {
+          const model = typeof x.model === 'string' && x.model ? x.model : null;
+          const had = x.id ? byId.get(x.id) : null;
+          if (had) {
+            had.model = had.model || model;
+            had.traceId = had.traceId || x.traceId || null;
+            had.startedAt = had.startedAt || Number(x.startedAt) || 0;
+            if (had.inputTokens == null) had.inputTokens = x.inputTokens;
+            if (had.outputTokens == null) had.outputTokens = x.outputTokens;
+            return;
+          }
+          const step = {
+            id: x.id || null, model: model, traceId: x.traceId || null, startedAt: Number(x.startedAt) || 0,
+            inputTokens: x.inputTokens, outputTokens: x.outputTokens,
+          };
+          if (x.id) byId.set(x.id, step);
+          steps.push(step);
+        });
+        steps.sort((a, b) => a.startedAt - b.startedAt);
+        return {
+          steps: steps, errors: errs.map((e) => String(e.message || e.subType || 'error').slice(0, 160)),
+          lost: lost, frames: frames, handoff: handoff, activity: activityOf(s),
+        };
+      },
+    };
+  }
+
+  function readLegacyAnswer(text) {
+    const reader = legacyReader();
+    text.split('\n').forEach(reader.push);
+    return reader.result();
+  }
+
+  // apricot-sorbet-high and apricot-sorbet-max are one model at two efforts.
+  const VARIANT_EFFORT = /-(none|minimal|low|medium|high|x-high|xhigh|max)$/;
+
+  function variantOf(id) {
+    const base = String(id || '').replace(/-(no-)?thinking$/, '');
+    const m = VARIANT_EFFORT.exec(base);
+    return { family: m ? base.slice(0, m.index) : base, effort: m ? m[1].replace('x-high', 'xhigh') : null };
+  }
+
+  function judgeLegacyRun(run, answer) {
+    noteLegacyProgress(run, answer, true);
+    const { own, named } = namedSteps(run, answer);
+    run.endedAt = Date.now();
+    run.traceMatched = own;
+    run.steps = named.length;
+    run.ranAll = uniq(named.map((s) => s.model));
+    run.tokensIn = named.reduce((n, s) => n + (Number(s.inputTokens) || 0), 0) || null;
+    run.tokensOut = named.reduce((n, s) => n + (Number(s.outputTokens) || 0), 0) || null;
+    run.error = answer.errors.length ? answer.errors[answer.errors.length - 1] : null;
+    run.ran = named.length ? named[named.length - 1].model : null;
+    if (!run.ran) {
+      run.status = run.error ? 'error' : 'unverified';
+    } else if (!run.sent) {
+      run.status = 'observed';
+    } else {
+      const family = variantOf(run.sent).family;
+      const other = run.ranAll.filter((m) => variantOf(m).family !== family);
+      run.status = other.length ? 'mismatch' : 'verified';
+      if (other.length) run.ran = other[other.length - 1];
+      // Another variant of the asked model is the server naming the effort it ran.
+      const v = variantOf(run.ran);
+      if (!other.length && run.ran !== run.sent && v.effort) {
+        run.ranEffort = v.effort;
+        run.effortStatus = !run.effort ? 'observed' : v.effort === run.effort ? 'verified' : 'mismatch';
+      }
+    }
+    const took = ' · ' + Math.round((run.endedAt - Date.parse(run.at)) / 1000) + ' s';
+    trace('old chat', {
+      verified: 'answered by ' + modelLabel(run.ran) + ' ✓ (server record' + (run.traceMatched ? ', same traceId' : '') + ')' +
+        (run.effortStatus === 'mismatch' ? ' · effort ' + run.effort + ' ≠ ran ' + run.ranEffort : '') + took,
+      mismatch: 'answered by ' + modelLabel(run.ran) + ' ≠ asked ' + modelLabel(run.sent) + took,
+      observed: 'Auto: answered by ' + modelLabel(run.ran) + took,
+      unverified: (run.handoff ? 'moved to the background queue before the model was named' : 'the answer did not name its model') +
+        ': not confirmed' + legacyWhere(run),
+      error: 'FAILED: ' + (run.error || 'error in the answer') + legacyWhere(run),
+    }[run.status]);
+    publishRuns();
+  }
+
   // Watch only (or nothing picked): pass the send through untouched, then look.
   function watchSend(self, args, opts, isNew) {
     const started = startRun(opts.body, isNew);
@@ -1845,7 +2285,7 @@ let settings = {
   // copy(__notionEffortAgentDiag()) — everything the effort lever knows.
   window.__notionEffortAgentDiag = function () {
     return JSON.stringify({
-      version: '2.26',
+      version: '2.28',
       watchOnly: watchOnly,
       runs: runs,
       url: location.href,
