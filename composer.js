@@ -285,12 +285,12 @@
       .foot .sd.warn { background: #d6a74a; }
       .foot .sd.err { background: #eb645f; }
       .foot .txt { flex: 1; }
-      .logbtn, .logcopy {
+      .logbtn, .logcopy, .oldreload {
         flex: none; font: inherit; font-size: 11px; color: #c8c8c4; cursor: pointer;
         background: rgba(255,255,255,0.06); border: 1px solid rgba(255,255,255,0.1);
         border-radius: 5px; padding: 2px 7px;
       }
-      .logbtn:hover, .logcopy:hover { background: rgba(255,255,255,0.12); }
+      .logbtn:hover, .logcopy:hover, .oldreload:hover { background: rgba(255,255,255,0.12); }
       .logbtn[aria-expanded="true"] { background: #1f4fd1; border-color: #1f4fd1; color: #fff; }
       .log {
         flex: none; border-top: 1px solid rgba(255,255,255,0.08);
@@ -333,6 +333,16 @@
       .runsbody .no { color: #eb8a86; }
       .watch { display: flex; align-items: center; gap: 6px; font-size: 11px; color: #c8c8c4; cursor: pointer; }
       .watchnote { padding: 0 10px 6px; font-size: 11px; color: #d6a74a; }
+      .oldchat {
+        flex: none; display: flex; align-items: center; gap: 6px; padding: 7px 10px;
+        font-size: 11px; color: #c8c8c4; cursor: pointer;
+        border-bottom: 1px solid rgba(255,255,255,0.08);
+      }
+      .oldnote {
+        flex: none; display: flex; align-items: center; justify-content: space-between; gap: 8px;
+        padding: 6px 10px; font-size: 11px; color: #d6a74a;
+        border-bottom: 1px solid rgba(255,255,255,0.08);
+      }
       .hidden { display: none !important; }
     </style>
 
@@ -350,6 +360,8 @@
         <div class="mname">Send a message to see the model</div>
         <div class="mmeta"></div>
       </div>
+      <label class="oldchat"><input type="checkbox" class="oldbox"> New chat opens the old chat</label>
+      <div class="oldnote hidden"><span>Reload Notion to apply</span><button class="oldreload" type="button">Reload</button></div>
       <div class="head">Reasoning effort</div>
       <div class="seg"></div>
       <div class="effnote"></div>
@@ -399,7 +411,7 @@
   const footTxt = shadow.querySelector('.txt');
   const logBox = shadow.querySelector('.log');
   const logBody = shadow.querySelector('.logbody');
-  const logBtn = shadow.querySelector('.logbtn:not(.chatbtn)');
+  const logBtn = shadow.querySelector('.logbtn:not(.chatbtn):not(.limbtn)');
   const chatBtn = shadow.querySelector('.chatbtn');
   const runsBox = shadow.querySelector('.runs');
   const runsBody = shadow.querySelector('.runsbody');
@@ -558,6 +570,23 @@
   shadow.querySelector('.watch').addEventListener('click', (e) => e.stopPropagation());
   watchBox.addEventListener('change', () => {
     window.postMessage({ type: 'NOTION_EFFORT_WATCH_ONLY', on: watchBox.checked }, '*');
+  });
+
+  // unlock.js reads this flag at document_start, so a change applies on reload.
+  const OLD_CHAT_KEY = 'notionUnlock.oldChat';
+  const oldBox = shadow.querySelector('.oldbox');
+  const oldNote = shadow.querySelector('.oldnote');
+  let oldChatAtLoad = true;
+  try { oldChatAtLoad = localStorage.getItem(OLD_CHAT_KEY) !== 'off'; } catch (e) {}
+  oldBox.checked = oldChatAtLoad;
+  shadow.querySelector('.oldchat').addEventListener('click', (e) => e.stopPropagation());
+  oldBox.addEventListener('change', () => {
+    try { localStorage.setItem(OLD_CHAT_KEY, oldBox.checked ? 'on' : 'off'); } catch (e) {}
+    oldNote.classList.toggle('hidden', oldBox.checked === oldChatAtLoad);
+  });
+  shadow.querySelector('.oldreload').addEventListener('click', (e) => {
+    e.stopPropagation();
+    location.reload();
   });
   const logCopy = shadow.querySelector('.logcopy');
   let traceEntries = [];

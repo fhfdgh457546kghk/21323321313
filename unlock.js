@@ -16,6 +16,9 @@
  *   2. JSON.parse hook                    (bootstrap blob inlined in HTML)
  *   3. fetch / XMLHttpRequest responses   (/v1/initialize, Notion API proxies)
  *   4. Live client instances              (checkGate / getFeatureGate / overrideAdapter)
+ *
+ * The same override store also carries the switch that makes "New chat" open
+ * the old chat instead of the agent chat (see "old chat on New chat" below).
  */
 (() => {
   'use strict';
@@ -543,15 +546,52 @@
   const LEGACY_KEY = 'STATSIG_LOCAL_STORAGE_INTERNAL_STORE_OVERRIDES_V3';
   const OVERRIDE_KEYS = [LEGACY_KEY, 'STATSIG_OVERRIDES', 'statsig.local-overrides'];
 
-  function overridePayload(existing) {
+  /* ---------------------- old chat on "New chat" --------------------- *
+   * Notion decides in the client which chat a new thread gets: the agent
+   * chat (createAgentThread) when experiment `agent_service` (or
+   * `agent_service_enterprise`) has group "on" and gate
+   * `agent_service_user_exclusion` is false; otherwise the old chat
+   * (runInferenceTranscript, with the native model and effort buttons).
+   * Notion's own LocalOverrideAdapter reads LEGACY_KEY via
+   * localStorage.getItem on every boot and outranks server values, so the
+   * getItem hook serves these entries there. They are never stored, so
+   * switching off takes effect on the next reload.
+   * ------------------------------------------------------------------ */
+  const OLD_CHAT_GATES = {
+    agent_service_user_exclusion: true,
+    // true forces group "on" before the experiment is even read
+    agent_service_personal_agent_override: false,
+    // true moves existing old-chat threads into the agent UI
+    agent_service_legacy_routing: false,
+  };
+  const OLD_CHAT_CONFIGS = {
+    agent_service: { group: 'control' },
+    agent_service_enterprise: { group: 'control' },
+  };
+  // Notion's saveConfig() writes in-memory overrides back to LEGACY_KEY under
+  // the raw name and its djb2 twin; both are stripped before serving.
+  const withDjb2 = (names) => names.flatMap((name) => [name, djb2(name)]);
+  const OLD_CHAT_GATE_KEYS = withDjb2(Object.keys(OLD_CHAT_GATES));
+  const OLD_CHAT_CONFIG_KEYS = withDjb2(Object.keys(OLD_CHAT_CONFIGS));
+  let oldChatEnabled = true;
+
+  /** `serve`: add the old-chat entries (only for what Notion reads, never for what is stored). */
+  function overridePayload(existing, serve) {
     let cur = {};
     try { cur = JSON.parse(existing || '{}') || {}; } catch (_) {}
     const gates = { ...(cur.gates || {}) };
+    const configs = { ...(cur.configs || {}) };
     for (const [key, value] of TARGETS) gates[key] = value;
+    OLD_CHAT_GATE_KEYS.forEach((key) => delete gates[key]);
+    OLD_CHAT_CONFIG_KEYS.forEach((key) => delete configs[key]);
+    if (serve && oldChatEnabled) {
+      Object.assign(gates, OLD_CHAT_GATES);
+      Object.assign(configs, OLD_CHAT_CONFIGS);
+    }
     return JSON.stringify({
       ...cur,
       gates,
-      configs: cur.configs || {},
+      configs,
       dynamicConfigs: cur.dynamicConfigs || {},
       layers: cur.layers || {},
     });
@@ -563,8 +603,10 @@
   const PLAN_FLAG_KEY = 'notionUnlock.planPatch';
   const TIER_MODE_KEY = 'notionUnlock.tierMode';
   const SEED_KEY = 'notionUnlock.seedModels';
+  const OLD_CHAT_FLAG_KEY = 'notionUnlock.oldChat';
   try {
     planPatchEnabled = rawGetItem.call(localStorage, PLAN_FLAG_KEY) !== 'off';
+    oldChatEnabled = rawGetItem.call(localStorage, OLD_CHAT_FLAG_KEY) !== 'off';
     tierMode = rawGetItem.call(localStorage, TIER_MODE_KEY) || 'strip';
     const rawSeed = rawGetItem.call(localStorage, SEED_KEY);
     if (rawSeed) {
@@ -583,7 +625,7 @@
 
     if (OVERRIDE_KEYS.includes(key)) {
       hit('storage', key);
-      return overridePayload(value);
+      return overridePayload(value, key === LEGACY_KEY);
     }
     // cached evaluations written by @statsig/js-client
     if (value && /statsig/i.test(key)) {
@@ -591,6 +633,16 @@
       if (patched) return patched;
     }
     return value;
+  };
+
+  // Notion's saveConfig() writes every in-memory override back to LEGACY_KEY,
+  // the served old-chat entries included; keep those out of storage so
+  // removing the extension also brings the new chat back.
+  Storage.prototype.setItem = function (key, value) {
+    if (key === LEGACY_KEY && typeof value === 'string') {
+      try { value = overridePayload(value); } catch (_) {}
+    }
+    return rawSetItem.call(this, key, value);
   };
 
   /* ---------------------------- 2. JSON.parse ------------------------ */
@@ -934,7 +986,34 @@
       console.log('[Notion Unlock] plan patch →', on ? 'ON' : 'OFF', '— reloading');
       location.reload();
     },
+
+    /** Whether "New chat" opens the old chat on this page load, and what Notion's client resolved. */
+    oldChat() {
+      const out = { enabled: oldChatEnabled };
+      try {
+        const root = window.__STATSIG__;
+        const client = root && (typeof root.instance === 'function' ? root.instance() : root.instance);
+        if (client && typeof client.getExperiment === 'function') {
+          const quiet = { disableExposureLog: true };
+          for (const name of Object.keys(OLD_CHAT_GATES)) out[name] = client.checkGate(name, quiet);
+          for (const name of Object.keys(OLD_CHAT_CONFIGS)) {
+            const exp = client.getExperiment(name, quiet);
+            out[name] = exp && exp.value ? exp.value.group : undefined;
+          }
+        }
+      } catch (_) {}
+      console.log('[Notion Unlock] old chat', out);
+      return out;
+    },
+
+    /** Toggle "New chat opens the old chat" (on by default) and reload. */
+    setOldChat(on) {
+      try { rawSetItem.call(localStorage, OLD_CHAT_FLAG_KEY, on ? 'on' : 'off'); } catch (_) {}
+      console.log('[Notion Unlock] old chat →', on ? 'ON' : 'OFF', '— reloading');
+      location.reload();
+    },
   };
 
-  console.log('[Notion Unlock] armed — gates:', Object.keys(GATES).length, '| debug: __notionUnlock.scan()');
+  console.log('[Notion Unlock] armed — gates:', Object.keys(GATES).length,
+    '| old chat:', oldChatEnabled ? 'ON' : 'OFF', '| debug: __notionUnlock.scan()');
 })();
