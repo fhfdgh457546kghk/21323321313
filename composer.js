@@ -236,6 +236,7 @@
       .search input:focus { border-color: #3b6ef0; }
       .mlist { padding: 0 6px 6px; overflow-y: auto; flex: 1 1 auto; min-height: 60px; }
       .mlist .row { padding: 5px 8px; font-size: 13px; }
+      .mlist .row.na .name, .mlist .row.na .hint { opacity: .5; }
       .mlist .empty { padding: 8px; font-size: 12px; color: #71716e; }
       .head { flex: none; }
       .model { flex: none; }
@@ -306,7 +307,8 @@
         overflow-y: auto; padding: 0 10px 8px; user-select: text;
         font: 11px/1.45 ui-monospace, Consolas, monospace; color: #c8c8c4;
       }
-      .logbody .row { white-space: pre-wrap; word-break: break-word; }
+      .logbody .row { display: block; padding: 0; border-radius: 0; cursor: default; white-space: pre-wrap; word-break: break-word; }
+      .logbody .row:hover { background: none; }
       .logbody .t { color: #6f6f6b; }
       .logbody .k { color: #8fb3ff; }
       .logbody .bad { color: #eb8a86; }
@@ -679,7 +681,7 @@
   }
 
   function nameOf(id) {
-    const m = modelById(id) || familyOf(id);
+    const m = modelById(id) || workflowOf(id) || familyOf(id);
     return m ? m.name : id;
   }
 
@@ -689,6 +691,11 @@
     const base = String(id || '').replace(/-(no-)?thinking$/, '');
     const m = VARIANT_EFFORT.exec(base);
     return m ? base.slice(0, m.index) : base;
+  }
+  /** The picker model whose old-chat (workflow) version has this id. */
+  function workflowOf(id) {
+    const key = id && Object.keys(state.spaceInfo).find((k) => state.spaceInfo[k].workflowId === id);
+    return key ? modelById(key) : null;
   }
   function familyOf(id) {
     if (!id) return null;
@@ -808,6 +815,12 @@
     return r && r.legacy && Date.parse(r.at) >= pageSince ? r : null;
   }
 
+  /** The chat on screen runs in the old chat (or a new one will). */
+  function oldChatScreen() {
+    if (legacyRun()) return true;
+    return oldChatOn() && !agentInfo();
+  }
+
   /** The agent chat record, only while that chat is on screen. */
   function agentInfo() {
     const ag = state.agent;
@@ -841,7 +854,8 @@
       };
     }
     const asked = r.sent ? nameOf(r.sent) : 'Auto';
-    const out = (level, text) => ({ level: level, current: true, text: text });
+    const blocked = r.blocked ? nameOf(r.blocked.model) + ' is not in the old chat (' + r.blocked.why + ') · ' : '';
+    const out = (level, text) => ({ level: blocked && level !== 'err' ? 'warn' : level, current: true, text: blocked + text });
     const since = Date.now() - Date.parse(r.at);
     if (r.status === 'pending') return out(null, 'Sending ' + asked + '… ' + clock(since));
     if (r.status === 'answering') {
@@ -858,15 +872,28 @@
         (r.activity ? ' · last step: ' + r.activity : '') + (r.ranSoFar ? ' · ' + nameOf(r.ranSoFar) + ' was answering' : ''));
     }
     if (r.status === 'error') {
+      if (r.outcome) return out('err', 'Failed on the server: ' + (r.error || r.outcome.status || 'error'));
       return out('err', 'Rejected: ' + asked + (r.http && r.http !== 200 ? ' (HTTP ' + r.http + ')' : '') +
         (r.error ? ': ' + r.error : ''));
     }
-    if (r.status === 'unverified') {
-      return out('warn', 'Sent as ' + asked + ', not confirmed: ' +
-        (r.handoff ? "Notion moved the answer to its background queue" : 'the answer did not name its model'));
+    if (r.status === 'server') {
+      // The stream closed early; the server keeps answering under a lease on the chat record.
+      if (r.pollError && !r.sawRunning) return out('warn', 'Stream closed, chat record not read: ' + r.pollError);
+      return out(null, (r.serverRunning
+        ? 'Server still answering' + (r.renewals ? ' (alive: lease renewed ×' + r.renewals + ')' : '')
+        : 'Stream closed · checking the chat record') + ' · ' + clock(since));
     }
-    if (r.status === 'observed') return out(null, 'Auto → ' + nameOf(r.ran) + ' (Notion chose)');
-    if (r.status === 'mismatch') return out('err', 'Swapped: ' + nameOf(r.ran) + ' answered instead of ' + asked);
+    if (r.status === 'lost') return out('err', 'Lost: ' + (r.note || 'no result on the server'));
+    if (r.status === 'timeout') return out('warn', 'Still running after 10 min: Notion stopped waiting');
+    if (r.status === 'unverified') {
+      return out('warn', 'Sent as ' + asked + ', not confirmed: ' + (r.note ||
+        (r.handoff ? "Notion moved the answer to its background queue" : 'the answer did not name its model')));
+    }
+    if (r.status === 'observed') {
+      return out(null, 'Auto → ' + nameOf(r.ran) + ' (Notion chose)' + (r.source === 'record' ? ' · saved answer' : ''));
+    }
+    const saved = r.source === 'record' ? ' · saved answer' : '';
+    if (r.status === 'mismatch') return out('err', 'Swapped: ' + nameOf(r.ran) + ' answered instead of ' + asked + saved);
     const lowered = r.clampedFrom ? ' (' + E(r.clampedFrom) + ' not supported)'
       : r.droppedEffort ? ' (' + E(r.droppedEffort) + ' not supported, model default)' : '';
     const effort = r.effortStatus === 'verified' ? ' · ' + E(r.effort) + ' ✓'
@@ -874,7 +901,7 @@
       : r.effortStatus === 'observed' ? ' · ran at ' + E(r.ranEffort)
       : r.effort ? ' · ' + E(r.effort) + ' sent' : '';
     return out(r.effortStatus === 'mismatch' ? 'err' : lowered ? 'warn' : 'ok',
-      'Confirmed by server: ' + nameOf(r.ran) + effort + lowered);
+      'Confirmed by server: ' + nameOf(r.ran) + effort + lowered + saved);
   }
 
   /** 75000 → "1:15". */
@@ -889,6 +916,11 @@
     lines.push('Asked: ' + (r.sent ? nameOf(r.sent) + ' (' + r.sent + ')' + (r.picked ? ' · panel pick' : " · Notion's menu")
       : 'Auto (the server picks)'));
     if (r.picked && r.native) lines.push("Notion's menu had: " + nameOf(r.native) + ' (' + r.native + ')');
+    if (r.blocked) lines.push(nameOf(r.blocked.model) + ' not sent: ' + r.blocked.why + " (Notion's menu model went instead)");
+    if (r.funding) {
+      lines.push('Billing: ' + (r.funding === 'chatgpt' ? 'your ChatGPT plan' : "Notion's AI allowance") +
+        (r.fundingWhy && r.funding !== 'chatgpt' ? ' (' + r.fundingWhy + ')' : '') + ' · expectedFundingRoute ' + r.funding);
+    }
     lines.push('Effort sent: ' + (r.effort || 'model default') +
       (r.clampedFrom ? ' (asked ' + r.clampedFrom + ', model limit)' : '') +
       (r.droppedEffort ? ' (' + r.droppedEffort + ' dropped, not supported)' : ''));
@@ -901,7 +933,23 @@
       lines.push('Stream: ' + r.frames + ' frames' + (r.lastDataAt ? ', last ' + clock(Date.now() - r.lastDataAt) + ' ago' : '') +
         (r.activity ? ' · last step: ' + r.activity : ''));
     }
+    if (r.marks && r.marks.length) lines.push('Frames (besides patches): ' + r.marks.join(' · '));
     if (r.handoff) lines.push("Moved to Notion's background queue: the rest arrives through the chat record");
+    if (r.followSince) {
+      lines.push('Chat record: ' + r.polls + ' check(s)' + (r.serverRunning ? ', server answering' : '') +
+        (r.lease ? ', lease to ' + new Date(r.lease).toLocaleTimeString() : '') +
+        (r.renewals ? ', renewed ×' + r.renewals : ''));
+    }
+    if (r.outcome) {
+      lines.push('Outcome on the server: ' + (r.outcome.status || '?') +
+        (r.outcome.steps != null ? ', ' + r.outcome.steps + ' steps' : '') + (r.outcome.error ? ', ' + r.outcome.error : ''));
+    }
+    if (r.source === 'record') {
+      lines.push('Model read from the saved steps of this message (thread_message records)');
+      lines.push('If Notion still looks busy, reload the page: the answer is saved');
+    }
+    if (r.pollError) lines.push('Chat record: ' + r.pollError);
+    if (r.note) lines.push('Note: ' + r.note);
     if (r.http) lines.push('HTTP ' + r.http);
     if (r.error) lines.push('Error: ' + r.error);
     if (r.watchOnly) lines.push('Watch only: sent as Notion built it');
@@ -913,18 +961,22 @@
     const waiting = r.status === 'pending' || r.status === 'answering';
     modelName.textContent = r.ran ? nameOf(r.ran)
       : waiting && r.ranSoFar ? nameOf(r.ranSoFar) + ' (answering…)'
-      : waiting ? 'Waiting for the answer…' : 'Not named by the server';
+      : waiting ? 'Waiting for the answer…'
+      : r.status === 'server' ? (r.ranSoFar ? nameOf(r.ranSoFar) + ' (server still answering…)' : 'Server still answering…')
+      : 'Not named by the server';
     modelMeta.textContent = '';
     modelMeta.append((r.ran || r.ranSoFar ? 'id: ' + (r.ran || r.ranSoFar) + ' · ' : '') + 'old chat');
     if (r.tokensIn || r.tokensOut) modelMeta.append(' · tokens ' + (r.tokensIn || 0) + ' in / ' + (r.tokensOut || 0) + ' out');
-    if (r.picked && r.native && familyKey(r.native) !== familyKey(r.picked)) {
+    if (r.picked && r.native && !r.blocked && familyKey(r.native) !== familyKey(r.picked)) {
       modelMeta.append(" · Notion's menu: " + nameOf(r.native) + ', not used');
     }
-    const badge = {
+    const badge = r.blocked ? ['warn', nameOf(r.blocked.model) + " not in the old chat: Notion's menu model ran"] : {
       verified: ['ok', 'the model asked for ✓'],
       mismatch: ['err', 'asked ' + nameOf(r.sent)],
       unverified: ['warn', 'not confirmed'],
       error: ['err', 'error'],
+      lost: ['err', 'lost'],
+      timeout: ['warn', 'still running after 10 min'],
     }[r.status];
     if (badge) {
       const s = document.createElement('span');
@@ -970,7 +1022,8 @@
     const waiting = r.status === 'pending' || r.status === 'answering';
     name.textContent = r.ran ? nameOf(r.ran) + (r.ranEffort ? ' · ' + r.ranEffort : '')
       : waiting ? (r.ranSoFar ? nameOf(r.ranSoFar) + ' · ' : '') + (r.activity || 'waiting for the answer') + '…'
-      : r.status === 'error' ? 'error' : r.status === 'stopped' ? 'stopped' : 'model not named';
+      : r.status === 'server' ? 'server still answering…'
+      : r.status === 'error' ? 'error' : r.status === 'stopped' ? 'stopped' : r.status === 'lost' ? 'lost' : 'model not named';
     const time = document.createElement('span');
     time.className = 'rtime';
     time.textContent = new Date(r.at).toLocaleTimeString() + (r.isNew ? ' · new chat' : '') + ' · old chat';
@@ -980,13 +1033,20 @@
     sub.textContent = (r.ran && nameOf(r.ran) !== r.ran ? 'id ' + r.ran + ' · ' : '') +
       'asked ' + (r.sent ? nameOf(r.sent) + (r.picked ? ' (panel)' : " (Notion's menu)") : 'Auto') +
       (r.picked && r.native && r.native !== r.picked ? ' · menu had ' + nameOf(r.native) : '') +
-      ' · effort sent ' + (r.effort || 'default') + (r.watchOnly ? ' · watch only' : '');
+      ' · effort sent ' + (r.effort || 'default') +
+      (r.blocked ? ' · ' + nameOf(r.blocked.model) + ' not in the old chat' : '') +
+      (r.funding ? ' · billing ' + (r.funding === 'chatgpt' ? 'ChatGPT plan' : 'Notion') : '') +
+      (r.watchOnly ? ' · watch only' : '');
     row.append(top, sub);
+    const saved = r.source === 'record' ? ' (saved answer)' : '';
     const verdict = {
-      verified: ['ok', 'Server confirmed: ' + nameOf(r.ran) + ' ✓'],
-      mismatch: ['no', 'Server ran ' + nameOf(r.ran) + ', not ' + nameOf(r.sent)],
-      observed: ['', 'Auto: Notion chose ' + nameOf(r.ran)],
-      unverified: ['', 'The answer did not name its model'],
+      verified: ['ok', 'Server confirmed: ' + nameOf(r.ran) + ' ✓' + saved],
+      mismatch: ['no', 'Server ran ' + nameOf(r.ran) + ', not ' + nameOf(r.sent) + saved],
+      observed: ['', 'Auto: Notion chose ' + nameOf(r.ran) + saved],
+      unverified: ['', r.note ? 'Not confirmed: ' + r.note : 'The answer did not name its model'],
+      server: ['', 'Stream closed early: following the chat record' + (r.serverRunning ? ' · server answering' : '')],
+      lost: ['no', 'Lost: ' + (r.note || 'no result on the server')],
+      timeout: ['', 'Still running after 10 min'],
       error: ['no', 'Error' + (r.http && r.http !== 200 ? ' HTTP ' + r.http : '') + (r.error ? ': ' + r.error : '')],
       stopped: ['', 'Stopped'],
     }[r.status];
@@ -1275,6 +1335,10 @@
     else if (pol && pol.status === 'error') {
       bad = true;
       msg = 'Could not set allowed models: ' + ((pol.detail && pol.detail.error) || 'error');
+    } else if (state.model && oldChatScreen() && state.spaceInfo[state.model] && state.spaceInfo[state.model].oldChat === false) {
+      msg = nameOf(state.model) + ' is not available in the old chat (' + (state.spaceInfo[state.model].oldChatWhy || 'new chat only') +
+        "): Notion's menu model is sent there. New chats: the workspace allows only " + nameOf(state.model) + '. Auto restores your list.';
+      bad = true;
     } else if (state.model) {
       msg = oldChatOn()
         ? nameOf(state.model) + ' goes with every old-chat message; for new chats the workspace allows only it. Auto restores your list.'
@@ -1308,7 +1372,11 @@
         const group = usable.filter((m) => m.family === f);
         if (!group.length) return;
         rows.push({ group: labels[f] || f });
-        group.forEach((m) => rows.push({ id: m.model, label: m.name, hint: effortRange(m) }));
+        group.forEach((m) => {
+          const info = state.spaceInfo[m.model];
+          const notHere = oldChatScreen() && info && info.oldChat === false;
+          rows.push({ id: m.model, label: m.name, hint: notHere ? info.oldChatWhy || 'new chat only' : effortRange(m), na: notHere });
+        });
       });
     let selRow = null;
     rows.forEach((r) => {
@@ -1320,8 +1388,8 @@
         return;
       }
       const row = document.createElement('div');
-      row.className = 'row' + (r.id === state.model ? ' sel' : '');
-      if (r.id) row.title = r.id;
+      row.className = 'row' + (r.id === state.model ? ' sel' : '') + (r.na ? ' na' : '');
+      if (r.id) row.title = r.id + (r.na ? '\nNot in the old chat: the old chat sends Notion\'s menu model instead' : '');
       const name = document.createElement('span');
       name.className = 'name';
       name.textContent = r.label;
@@ -1598,6 +1666,7 @@
           efforts: Array.isArray(m.efforts) ? m.efforts : null,
           defaultEffort: m.defaultEffort || null,
           rateLimit: m.rateLimit, outage: m.outage, disabled: m.disabled, credit: m.credit, optIn: m.optIn,
+          oldChat: m.oldChat === undefined ? null : m.oldChat, oldChatWhy: m.oldChatWhy || null, workflowId: m.workflowId || null,
         };
       });
       state.spaceModels = e.data.models.map((m) => m.model);
@@ -1682,7 +1751,7 @@
       pageSince = Date.now();
     }
     const lr = legacyRun();
-    if (!moved && !(lr && (lr.status === 'pending' || lr.status === 'answering'))) return;
+    if (!moved && !(lr && (lr.status === 'pending' || lr.status === 'answering' || lr.status === 'server'))) return;
     renderPill();
     renderFoot();
     if (moved && state.open) renderList();

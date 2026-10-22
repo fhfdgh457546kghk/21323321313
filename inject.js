@@ -464,21 +464,29 @@ let settings = {
     const chat = !target.key && isChatConfig(cfg);
     const nativeModel = reqModel ? reqModel.id : null;
     const pick = chat && !watchOnly ? settings.model : null;
+    const info = pick ? oldChatInfo(pick) : null;
+    // A model the old chat cannot run is not sent: Notion's own pick goes instead.
+    const blocked = info && !info.ok ? { model: pick, why: info.why } : null;
+    const send = pick && !blocked ? (info && info.id) || pick : null;
     let clampedFrom = null;
     let droppedEffort = null;
     let modified = false;
-    if (pick && (cfg.model !== pick || cfg.modelFromUser !== true)) {
-      cfg.model = pick;
+    if (send && (cfg.model !== send || cfg.modelFromUser !== true)) {
+      cfg.model = send;
       // Without modelFromUser the server treats the send as Auto and picks the model itself.
       cfg.modelFromUser = true;
       modified = true;
     }
-    if (pick && pick !== nativeModel && body.expectedFundingRoute === 'chatgpt') {
-      // Only Notion's own OpenAI pick can be billed to a connected ChatGPT account.
-      body.expectedFundingRoute = 'ordinary';
-      modified = true;
+    let funding = null;
+    if (send && send !== nativeModel && typeof body.expectedFundingRoute === 'string') {
+      funding = legacyFunding(info ? info.entry : catalogueEntry(pick));
+      if (body.expectedFundingRoute !== funding.route) {
+        body.expectedFundingRoute = funding.route;
+        modified = true;
+      }
     }
-    const activeModel = pick || nativeModel;
+    // Effort ceilings are keyed by the picker's id, not the workflow id.
+    const activeModel = send ? pick : nativeModel;
     const requestedEffort = watchOnly ? null : settings.effort;
 
     // Safety net: if Notion moved to a model we have never seen, we have no
@@ -504,7 +512,7 @@ let settings = {
     }
     // Notion chose its effort for its own model. One the picked model does not
     // take makes the server drop the pick, so it goes and the model default applies.
-    if (pick && !targetEffort && cfg[effortKey] && Array.isArray(supported) &&
+    if (send && !targetEffort && cfg[effortKey] && Array.isArray(supported) &&
         supported.indexOf(cfg[effortKey]) === -1) {
       droppedEffort = cfg[effortKey];
       delete cfg[effortKey];
@@ -538,6 +546,10 @@ let settings = {
           clampedFrom: clampedFrom,
           droppedEffort: droppedEffort,
           threadId: typeof body.threadId === 'string' ? body.threadId : null,
+          spaceId: typeof body.spaceId === 'string' ? body.spaceId : null,
+          blocked: blocked,
+          funding: typeof body.expectedFundingRoute === 'string' ? body.expectedFundingRoute : null,
+          fundingWhy: funding ? funding.why : null,
           traceId: typeof body.traceId === 'string' ? body.traceId : null,
           isNew: body.createThread === true,
         }
@@ -1460,10 +1472,61 @@ let settings = {
         // Opt-in models (Fable on a trial, ...). Note restrictedForPersonalAgent
         // is no guide: it is also true for every model the policy disables.
         const optIn = ((json && json.restrictedAccessModelsInPickerConfig) || []).map((r) => r && r.codename).filter(Boolean);
-        catalogue = { spaceId: plainId(spaceId), models: models, optIn: optIn };
+        catalogue = {
+          spaceId: plainId(spaceId), models: models, optIn: optIn,
+          // ChatGPT plan connected to Notion (token sharing) and own API keys: who pays for OpenAI models.
+          tokenSharing: (json && json.providerTokenSharing && json.providerTokenSharing.openai) || null,
+          byok: (json && json.byok && Array.isArray(json.byok.enrolledProviders)) ? json.byok.enrolledProviders : [],
+        };
         publishCatalogue();
         return models;
       });
+  }
+
+  // getAvailableModels gives every model a version per runtime: workflow (the
+  // old chat), agentService (the new chat), customAgent. The old chat sends
+  // workflow.finalModelName; a model without a usable workflow version
+  // (GLM 5.3 and others) does not run there.
+  function catalogueEntry(id) {
+    return (catalogue && catalogue.models.find((m) => m.model === id ||
+      (m.workflow && m.workflow.finalModelName === id))) || null;
+  }
+
+  const reasonText = (r) => (typeof r === 'string' ? r : r && typeof r === 'object' ? String(r.type || r.reason || '') : '');
+
+  /** { ok, id, entry, why } for the old chat; null = no per-runtime data to judge by. */
+  function oldChatInfo(id) {
+    if (!catalogue || !catalogue.models.some((m) => 'workflow' in m || 'agentService' in m)) return null;
+    const m = catalogueEntry(id);
+    if (!m) return null;
+    const w = m.workflow;
+    if (!w || !w.finalModelName) return { ok: false, entry: m, why: 'new chat only' };
+    const off = w.isDisabled != null ? w.isDisabled : m.isDisabled;
+    const why = reasonText(w.disabledReason || m.disabledReason);
+    if (off) return { ok: false, entry: m, why: 'disabled in the old chat' + (why ? ': ' + why : '') };
+    return { ok: true, entry: m, id: w.finalModelName };
+  }
+
+  /**
+   * expectedFundingRoute for a model in the old chat (runtime "legacy"), by
+   * Notion's own rule: "chatgpt" when an OpenAI model can draw on the ChatGPT
+   * plan connected to Notion, otherwise "ordinary" (Notion's AI allowance).
+   */
+  function legacyFunding(entry) {
+    const ts = catalogue && catalogue.tokenSharing;
+    const no = (why) => ({ route: 'ordinary', why: why });
+    if (!entry || entry.modelProvider !== 'openai' || !entry.workflow) return no('not an OpenAI model');
+    if (!ts) return no('no ChatGPT plan connected');
+    if (Array.isArray(ts.supportedRuntimes) && ts.supportedRuntimes.indexOf('legacy') === -1) {
+      return no('Notion bills a connected ChatGPT plan only in the new chat');
+    }
+    if (ts.connectionStatus !== 'connected') return no('ChatGPT plan ' + String(ts.connectionStatus || 'not connected'));
+    if (ts.eligible === false || ts.enabled === false) return no('ChatGPT plan billing is off');
+    if (ts.allowanceStatus === 'exhausted') return no('ChatGPT plan allowance used up');
+    if (catalogue.byok.indexOf('openai') !== -1) return no('OpenAI runs on your own API key');
+    if (entry.restrictedForPersonalAgent === true) return no('model not covered by the ChatGPT plan');
+    if ((entry.workflow.isDisabled != null ? entry.workflow.isDisabled : entry.isDisabled) === true) return no('model disabled');
+    return { route: 'chatgpt', why: 'ChatGPT plan' };
   }
 
   const FAMILY_OF = { openai: 'openai', anthropic: 'anthropic', gemini: 'gemini', xai: 'xai' };
@@ -1486,6 +1549,15 @@ let settings = {
         disabled: !!m.isDisabled,
         credit: !!(m.modelCardAttributes && m.modelCardAttributes.billsNotionCredits),
         optIn: isOptIn(m.model),
+        workflowId: (m.workflow && m.workflow.finalModelName) || null,
+        oldChat: (function () {
+          const o = oldChatInfo(m.model);
+          return o ? o.ok : null;
+        })(),
+        oldChatWhy: (function () {
+          const o = oldChatInfo(m.model);
+          return o && !o.ok ? o.why : null;
+        })(),
       })),
     }, '*');
   }
@@ -1758,6 +1830,7 @@ let settings = {
   function startLegacyRun(r) {
     const run = {
       legacy: true, at: new Date().toISOString(), thread: r.threadId ? plainId(r.threadId) : null, isNew: r.isNew,
+      spaceId: r.spaceId || null, blocked: r.blocked || null, funding: r.funding || null, fundingWhy: r.fundingWhy || null,
       watchOnly: watchOnly, picked: r.pick || null, native: r.nativeModel || null, sent: r.explicit || null,
       effort: r.effortOut || null, effortAsked: r.requestedEffort || null,
       clampedFrom: r.clampedFrom || null, droppedEffort: r.droppedEffort || null,
@@ -1773,6 +1846,9 @@ let settings = {
       ' · effort ' + (run.effort || 'model default') +
       (run.clampedFrom ? ' (' + run.clampedFrom + ' not supported)' : '') +
       (run.droppedEffort ? ' (' + run.droppedEffort + ' dropped: not supported)' : '') +
+      (run.blocked ? ' · ' + modelLabel(run.blocked.model) + ' not sent: ' + run.blocked.why : '') +
+      (run.funding ? ' · billing: ' + (run.funding === 'chatgpt' ? 'ChatGPT plan' : 'Notion' +
+        (run.fundingWhy ? ' (' + run.fundingWhy + ')' : '')) : '') +
       (run.watchOnly ? ' · watch only: sent as is' : ''));
     publishRuns();
     return run;
@@ -1784,10 +1860,17 @@ let settings = {
   }
 
   function failLegacyRun(run, e) {
-    run.status = e && e.name === 'AbortError' ? 'stopped' : 'error';
+    const stopped = !!e && e.name === 'AbortError';
     run.error = String((e && e.message) || e).slice(0, 160);
     run.endedAt = Date.now();
-    trace('old chat', (run.status === 'stopped' ? 'stopped' : 'FAILED: ' + run.error) + legacyWhere(run));
+    // A broken connection does not stop the answer on the server.
+    if (!stopped && canFollow(run)) {
+      trace('old chat', 'stream broke (' + run.error + ')' + legacyWhere(run) + ' · following the chat record');
+      followLegacyRun(run);
+      return;
+    }
+    run.status = stopped ? 'stopped' : 'error';
+    trace('old chat', (stopped ? 'stopped' : 'FAILED: ' + run.error) + legacyWhere(run));
     publishRuns();
   }
 
@@ -1873,6 +1956,9 @@ let settings = {
 
   function noteLegacyProgress(run, answer, quiet) {
     run.frames = answer.frames;
+    run.frameCounts = answer.counts;
+    const t0 = Date.parse(run.at);
+    run.marks = answer.marks.map((m) => ((m.at - t0) / 1000).toFixed(1) + 's ' + m.type + (m.info ? ' (' + m.info + ')' : ''));
     run.activity = answer.activity || run.activity || null;
     const named = namedSteps(run, answer).named;
     run.ranSoFar = named.length ? named[named.length - 1].model : run.ranSoFar || null;
@@ -2002,6 +2088,21 @@ let settings = {
     return String(last.type || '?').slice(0, 40);
   }
 
+  /** Frame types and short facts only: no message text reaches the log. */
+  function frameInfo(msg) {
+    if ((msg.type === 'patch-start' || msg.type === 'patch-sync') && msg.data && Array.isArray(msg.data.s)) {
+      return msg.data.s.length + ' steps: ' + msg.data.s.slice(-6).map((x) => String((x && x.type) || '?').slice(0, 40)).join(', ');
+    }
+    if (msg.type === 'inference-connection-lifecycle') {
+      return [msg.reason, msg.shutdownReason].filter((x) => typeof x === 'string').join('/').slice(0, 80);
+    }
+    if (msg.type === 'record-map' && msg.recordMap && typeof msg.recordMap === 'object') {
+      return Object.keys(msg.recordMap).join('+').slice(0, 80);
+    }
+    if (msg.type === 'error') return String(msg.subType || msg.errorCode || '').slice(0, 60);
+    return '';
+  }
+
   /** Reads an old-chat answer line by line, rebuilding the run's steps the way Notion does. */
   function legacyReader() {
     let doc = { s: [] };
@@ -2010,6 +2111,8 @@ let settings = {
     let handoff = false;
     const found = [];
     const errors = [];
+    const counts = {};
+    const marks = []; // every frame but the many small patches
     return {
       push(line) {
         if (!line || !line.trim()) return;
@@ -2021,6 +2124,9 @@ let settings = {
         }
         if (!msg || typeof msg !== 'object') return;
         frames++;
+        const type = String(msg.type || '?').slice(0, 40);
+        counts[type] = (counts[type] || 0) + 1;
+        if (type !== 'patch' && marks.length < 12) marks.push({ at: Date.now(), type: type, info: frameInfo(msg) });
         if ((msg.type === 'patch-start' || msg.type === 'patch-sync') && msg.data && Array.isArray(msg.data.s)) {
           doc = { s: msg.data.s };
           lost = false;
@@ -2064,7 +2170,7 @@ let settings = {
         steps.sort((a, b) => a.startedAt - b.startedAt);
         return {
           steps: steps, errors: errs.map((e) => String(e.message || e.subType || 'error').slice(0, 160)),
-          lost: lost, frames: frames, handoff: handoff, activity: activityOf(s),
+          lost: lost, frames: frames, handoff: handoff, activity: activityOf(s), counts: counts, marks: marks,
         };
       },
     };
@@ -2085,43 +2191,225 @@ let settings = {
     return { family: m ? base.slice(0, m.index) : base, effort: m ? m[1].replace('x-high', 'xhigh') : null };
   }
 
+  /** Model verdict for named agent-inference steps (chronological); false when none name a model. */
+  function judgeModels(run, named) {
+    run.steps = named.length;
+    run.ranAll = uniq(named.map((s) => s.model));
+    run.tokensIn = named.reduce((n, s) => n + (Number(s.inputTokens) || 0), 0) || null;
+    run.tokensOut = named.reduce((n, s) => n + (Number(s.outputTokens) || 0), 0) || null;
+    run.ran = named.length ? named[named.length - 1].model : null;
+    run.ranEffort = null;
+    run.effortStatus = null;
+    if (!run.ran) return false;
+    if (!run.sent) {
+      run.status = 'observed';
+      return true;
+    }
+    const family = variantOf(run.sent).family;
+    const other = run.ranAll.filter((m) => variantOf(m).family !== family);
+    run.status = other.length ? 'mismatch' : 'verified';
+    if (other.length) run.ran = other[other.length - 1];
+    // Another variant of the asked model is the server naming the effort it ran.
+    const v = variantOf(run.ran);
+    if (!other.length && run.ran !== run.sent && v.effort) {
+      run.ranEffort = v.effort;
+      run.effortStatus = !run.effort ? 'observed' : v.effort === run.effort ? 'verified' : 'mismatch';
+    }
+    return true;
+  }
+
+  function verdictLine(run) {
+    return {
+      verified: 'answered by ' + modelLabel(run.ran) + ' ✓' +
+        (run.effortStatus === 'mismatch' ? ' · effort ' + run.effort + ' ≠ ran ' + run.ranEffort : ''),
+      mismatch: 'answered by ' + modelLabel(run.ran) + ' ≠ asked ' + modelLabel(run.sent),
+      observed: 'Auto: answered by ' + modelLabel(run.ran),
+    }[run.status] || '';
+  }
+
+  const legacyAge = (run) => ' · ' + Math.round((Date.now() - Date.parse(run.at)) / 1000) + ' s after sending';
+
   function judgeLegacyRun(run, answer) {
     noteLegacyProgress(run, answer, true);
     const { own, named } = namedSteps(run, answer);
     run.endedAt = Date.now();
     run.traceMatched = own;
-    run.steps = named.length;
-    run.ranAll = uniq(named.map((s) => s.model));
-    run.tokensIn = named.reduce((n, s) => n + (Number(s.inputTokens) || 0), 0) || null;
-    run.tokensOut = named.reduce((n, s) => n + (Number(s.outputTokens) || 0), 0) || null;
     run.error = answer.errors.length ? answer.errors[answer.errors.length - 1] : null;
-    run.ran = named.length ? named[named.length - 1].model : null;
-    if (!run.ran) {
-      run.status = run.error ? 'error' : 'unverified';
-    } else if (!run.sent) {
-      run.status = 'observed';
+    if (judgeModels(run, named)) {
+      run.source = 'stream';
+      trace('old chat', verdictLine(run) + ' (server record' + (run.traceMatched ? ', same traceId' : '') + ')' +
+        ' · ' + Math.round((run.endedAt - Date.parse(run.at)) / 1000) + ' s');
+    } else if (run.error) {
+      run.status = 'error';
+      trace('old chat', 'FAILED: ' + run.error + legacyWhere(run));
+    } else if (canFollow(run)) {
+      trace('old chat', (run.handoff ? 'moved to the background queue' : 'stream closed before the answer') + legacyWhere(run) +
+        (run.marks && run.marks.length ? ' · frames: ' + run.marks.join(', ') : '') +
+        ' · following the chat record (Notion waits for it the same way, up to 10 min)');
+      followLegacyRun(run);
+      return;
     } else {
-      const family = variantOf(run.sent).family;
-      const other = run.ranAll.filter((m) => variantOf(m).family !== family);
-      run.status = other.length ? 'mismatch' : 'verified';
-      if (other.length) run.ran = other[other.length - 1];
-      // Another variant of the asked model is the server naming the effort it ran.
-      const v = variantOf(run.ran);
-      if (!other.length && run.ran !== run.sent && v.effort) {
-        run.ranEffort = v.effort;
-        run.effortStatus = !run.effort ? 'observed' : v.effort === run.effort ? 'verified' : 'mismatch';
-      }
+      run.status = 'unverified';
+      trace('old chat', 'the answer did not name its model: not confirmed' + legacyWhere(run));
     }
-    const took = ' · ' + Math.round((run.endedAt - Date.parse(run.at)) / 1000) + ' s';
-    trace('old chat', {
-      verified: 'answered by ' + modelLabel(run.ran) + ' ✓ (server record' + (run.traceMatched ? ', same traceId' : '') + ')' +
-        (run.effortStatus === 'mismatch' ? ' · effort ' + run.effort + ' ≠ ran ' + run.ranEffort : '') + took,
-      mismatch: 'answered by ' + modelLabel(run.ran) + ' ≠ asked ' + modelLabel(run.sent) + took,
-      observed: 'Auto: answered by ' + modelLabel(run.ran) + took,
-      unverified: (run.handoff ? 'moved to the background queue before the model was named' : 'the answer did not name its model') +
-        ': not confirmed' + legacyWhere(run),
-      error: 'FAILED: ' + (run.error || 'error in the answer') + legacyWhere(run),
-    }[run.status]);
+    publishRuns();
+  }
+
+  // ---- Old chat: after the stream -------------------------------------------
+  //
+  // The server runs an old-chat answer under a lease on the thread record
+  // (current_inference_id = the request's traceId, plus
+  // current_inference_lease_expiration); the HTTP stream is only a live view
+  // and can close early, e.g. after 60 s of silence while the model thinks.
+  // Notion's page then waits on the same record for up to 10 min:
+  // data.last_turn_outcome names the finished run (inference_id) and its
+  // final step, and the steps are saved as thread_message records (message id =
+  // step id). Following it tells "still answering" from "lost", and the saved
+  // agent-inference steps name the model of a long answer.
+
+  const FOLLOW_MS = 600000;
+
+  function canFollow(run) {
+    return !!(run.thread && run.traceId && run.spaceId);
+  }
+
+  function recordsOf(json, table) {
+    const map = json && json.recordMap && json.recordMap[table];
+    return map ? Object.keys(map).map((id) => unwrapRecord(map[id])).filter((v) => v && v.id) : [];
+  }
+
+  function syncRecords(spaceId, table, ids) {
+    return apiPost('chat record', spaceId, '/api/v3/syncRecordValues', {
+      requests: ids.map((id) => ({ pointer: { table: table, id: dashedId(id), spaceId: spaceId }, version: -1 })),
+    }).then((json) => recordsOf(json, table));
+  }
+
+  function followLegacyRun(run) {
+    if (run.status === 'server') return;
+    run.status = 'server';
+    run.followSince = Date.now();
+    run.polls = 0;
+    run.renewals = 0;
+    run.idle = 0;
+    run.missing = 0;
+    publishRuns();
+    const next = (ms) => setTimeout(() => {
+      if (run.status !== 'server') return;
+      if (runs.some((r) => r !== run && r.legacy && r.thread === run.thread && Date.parse(r.at) > Date.parse(run.at))) {
+        settleFollow(run, 'unverified', 'a newer message was sent in this chat before the server finished');
+        return;
+      }
+      if (Date.now() - run.followSince > FOLLOW_MS) {
+        settleFollow(run, 'timeout', 'still running after 10 min: Notion stops waiting too');
+        return;
+      }
+      pollLegacyRun(run).then((again) => {
+        if (again) next(run.polls < 12 ? 5000 : 15000);
+      }, (e) => {
+        const why = String((e && e.message) || e).slice(0, 160);
+        if (run.pollError !== why) trace('old chat', 'chat record read failed: ' + why);
+        run.pollError = why;
+        publishRuns();
+        next(15000);
+      });
+    }, ms);
+    next(1500);
+  }
+
+  function settleFollow(run, status, why) {
+    run.status = status;
+    run.note = why;
+    run.endedAt = Date.now();
+    trace('old chat', 'chat record: ' + why + legacyAge(run));
+    publishRuns();
+  }
+
+  /** One look at the thread record; true = look again. */
+  async function pollLegacyRun(run) {
+    run.polls++;
+    run.lastPollAt = Date.now();
+    const th = (await syncRecords(run.spaceId, 'thread', [run.thread])).find((t) => plainId(t.id) === run.thread);
+    if (!th) {
+      run.missing++;
+      run.pollError = 'the chat record was not returned';
+      publishRuns();
+      if (run.missing < 3) return true;
+      settleFollow(run, 'unverified', 'the chat record could not be read');
+      return false;
+    }
+    run.missing = 0;
+    run.pollError = null;
+    const outcome = th.data && th.data.last_turn_outcome;
+    if (outcome && plainId(outcome.inference_id) === plainId(run.traceId)) {
+      await finishFromRecord(run, th, outcome);
+      return false;
+    }
+    const lease = Number(th.current_inference_lease_expiration) || 0;
+    const mine = !!th.current_inference_id && plainId(th.current_inference_id) === plainId(run.traceId);
+    // A lease that moves forward is the server saying it is still on it.
+    if (mine && lease && run.lease && lease > run.lease) run.renewals++;
+    run.lease = mine ? lease || null : null;
+    run.serverRunning = mine && (!lease || lease > Date.now());
+    if (run.serverRunning) {
+      if (!run.sawRunning) {
+        run.sawRunning = true;
+        trace('old chat', 'chat record: the server is still answering' +
+          (lease ? ' (lease to ' + new Date(lease).toLocaleTimeString() + ')' : '') + legacyAge(run));
+      }
+      run.idle = 0;
+      publishRuns();
+      return true;
+    }
+    // Neither running nor finished: a few looks' grace for the outcome to be written.
+    run.idle++;
+    publishRuns();
+    if (run.idle < 3) return true;
+    settleFollow(run, 'lost', (mine ? 'the server lease ran out without a result' : 'the server holds no run and no result for this message') +
+      ': the answer was lost, send it again');
+    return false;
+  }
+
+  async function finishFromRecord(run, th, outcome) {
+    run.serverRunning = false;
+    run.outcome = {
+      status: typeof outcome.status === 'string' ? outcome.status : null,
+      steps: outcome.step_count != null ? outcome.step_count : null,
+      finalStep: outcome.final_step_id || null,
+      error: (outcome.error && String(outcome.error.type || outcome.error.message || '').slice(0, 120)) || null,
+    };
+    let steps = [];
+    try {
+      // The newest messages hold this turn's steps.
+      const ids = Array.isArray(th.messages) ? th.messages.slice(-40) : [];
+      if (ids.length) {
+        steps = (await syncRecords(run.spaceId, 'thread_message', ids)).map((m) => m.step)
+          .filter((x) => x && x.type === 'agent-inference');
+      }
+    } catch (e) {
+      run.pollError = 'saved steps not read: ' + String((e && e.message) || e).slice(0, 120);
+    }
+    const own = steps.filter((x) => plainId(x.traceId) === plainId(run.traceId) && typeof x.model === 'string' && x.model)
+      .sort((a, b) => (Number(a.startedAt) || 0) - (Number(b.startedAt) || 0));
+    run.endedAt = Date.now();
+    run.traceMatched = own.length > 0;
+    const named = judgeModels(run, own);
+    if (named) run.source = 'record';
+    const st = run.outcome.status;
+    if (st === 'error' || st === 'abandoned') {
+      run.status = 'error';
+      run.error = run.outcome.error || st;
+    } else if (st === 'stopped') {
+      run.status = 'stopped';
+    } else if (!named) {
+      run.status = 'unverified';
+      run.note = 'the saved steps do not name the model';
+    }
+    trace('old chat', 'chat record: finished (' + (st || '?') +
+      (run.outcome.steps != null ? ', ' + run.outcome.steps + ' steps' : '') + ')' + legacyAge(run) +
+      (named ? ' · ' + verdictLine(run) + ' (saved steps, same traceId)' : '') +
+      (run.status === 'error' ? ' · error: ' + run.error : '') +
+      (run.status === 'unverified' ? ' · ' + run.note : '') +
+      (run.status !== 'error' && run.status !== 'stopped' ? ' · if Notion still looks busy, reload the page: the answer is saved' : ''));
     publishRuns();
   }
 
@@ -2285,7 +2573,7 @@ let settings = {
   // copy(__notionEffortAgentDiag()) — everything the effort lever knows.
   window.__notionEffortAgentDiag = function () {
     return JSON.stringify({
-      version: '2.28',
+      version: '2.29',
       watchOnly: watchOnly,
       runs: runs,
       url: location.href,
